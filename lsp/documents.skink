@@ -1,0 +1,203 @@
+// Module documents provides text document tracking for the LSP server.
+//
+// It maintains the content, version, and URI of each open document, allowing
+// the server to provide diagnostics, completion, and other features without
+// re-reading files from disk.
+module documents
+
+import "std/str"
+
+// Document represents a single open text document.
+pub struct Document {
+    uri: string
+    text: string
+    version: int
+    isOpen: bool
+}
+
+// DocumentManager tracks all open documents.
+pub struct DocumentManager {
+    docs: []Document
+}
+
+// newDocumentManager creates an empty document manager.
+pub fn newDocumentManager() -> DocumentManager {
+    dm := DocumentManager{}
+    var emptyDocs []Document
+    dm.docs = emptyDocs
+    return dm
+}
+
+// findIndex returns the index of a document by URI, or -1 if not found.
+fn findIndex(dm: *DocumentManager, uri: string) -> int {
+    for i := 0; i < len(dm.docs); i = i + 1 {
+        if str.Equal(dm.docs[i].uri, uri) {
+            return i
+        }
+    }
+    return -1
+}
+
+// open registers a new document or replaces an existing one.
+pub fn open(dm: *DocumentManager, uri: string, text: string, version: int) {
+    idx := findIndex(dm, uri)
+    if idx >= 0 {
+        // The old text is RC-managed (allocated by Skink_mem_alloc via the
+        // JSON parser / str functions). Let the RC system reclaim it by
+        // overwriting the reference — do NOT call libc.free, which would
+        // bypass the RCHeader and corrupt the heap.
+        dm.docs[idx].text = text
+        dm.docs[idx].version = version
+        dm.docs[idx].isOpen = true
+        return
+    }
+    dm.docs = append(dm.docs, Document{uri: uri, text: text, version: version, isOpen: true})
+}
+
+// update replaces the full text of a document (full document sync mode).
+pub fn update(dm: *DocumentManager, uri: string, text: string, version: int) {
+    idx := findIndex(dm, uri)
+    if idx < 0 {
+        // Document not tracked yet — add it
+        dm.docs = append(dm.docs, Document{uri: uri, text: text, version: version, isOpen: true})
+        return
+    }
+    // RC-managed string — let the RC system reclaim the old text.
+    dm.docs[idx].text = text
+    dm.docs[idx].version = version
+}
+
+// close removes the document from the manager entirely.
+// Previously the entry was kept (isOpen=false, text=""), which caused
+// Document structs and URI strings to accumulate for every file ever
+// opened during a long session. Removing the entry lets the RC system
+// reclaim both the URI and the Document wrapper.
+pub fn close(dm: *DocumentManager, uri: string) {
+    idx := findIndex(dm, uri)
+    if idx < 0 {
+        return
+    }
+    var newDocs []Document
+    for i := 0; i < len(dm.docs); i = i + 1 {
+        if i != idx {
+            newDocs = append(newDocs, dm.docs[i])
+        }
+    }
+    dm.docs = newDocs
+}
+
+// getText returns the current text of a document and whether it was found.
+pub fn getText(dm: *DocumentManager, uri: string) -> (string, bool) {
+    idx := findIndex(dm, uri)
+    if idx < 0 {
+        return "", false
+    }
+    if !dm.docs[idx].isOpen {
+        return "", false
+    }
+    return dm.docs[idx].text, true
+}
+
+// getVersion returns the version of a document, or -1 if not found.
+pub fn getVersion(dm: *DocumentManager, uri: string) -> int {
+    idx := findIndex(dm, uri)
+    if idx < 0 {
+        return -1
+    }
+    return dm.docs[idx].version
+}
+
+// isOpen reports whether a document is currently open.
+pub fn isOpen(dm: *DocumentManager, uri: string) -> bool {
+    idx := findIndex(dm, uri)
+    if idx < 0 {
+        return false
+    }
+    return dm.docs[idx].isOpen
+}
+
+// uriToPath converts a file:// URI to a filesystem path.
+pub fn uriToPath(uri: string) -> string {
+    if str.StartsWith(uri, "file://") {
+        return str.Substr(uri, 7, str.Len(uri) - 7)
+    }
+    return uri
+}
+
+// pathToUri converts a filesystem path to a file:// URI.
+pub fn pathToUri(path: string) -> string {
+    if str.StartsWith(path, "file://") {
+        return path
+    }
+    return str.Concat("file://", path)
+}
+
+// lineCount returns the number of lines in the document text.
+pub fn lineCount(text: string) -> int {
+    if str.Len(text) == 0 {
+        return 0
+    }
+    count := 1
+    for i := 0; i < str.Len(text); i = i + 1 {
+        if text[i] == 10 { // '\n'
+            count = count + 1
+        }
+    }
+    return count
+}
+
+// lineAt returns the text of a specific 0-based line number.
+// Returns empty string if the line doesn't exist.
+pub fn lineAt(text: string, line: int) -> string {
+    currentLine := 0
+    start := 0
+    for i := 0; i < str.Len(text); i = i + 1 {
+        if currentLine == line {
+            start = i
+            // Find end of line
+            end := i
+            for end < str.Len(text) && text[end] != 10 {
+                end = end + 1
+            }
+            return str.Substr(text, start, end - start)
+        }
+        if text[i] == 10 {
+            currentLine = currentLine + 1
+        }
+    }
+    return ""
+}
+
+// offsetAt converts a 0-based line and character position to a byte offset
+// within the text. Returns -1 if the position is out of range.
+pub fn offsetAt(text: string, line: int, character: int) -> int {
+    currentLine := 0
+    for i := 0; i < str.Len(text); i = i + 1 {
+        if currentLine == line {
+            return i + character
+        }
+        if text[i] == 10 {
+            currentLine = currentLine + 1
+        }
+    }
+    return -1
+}
+
+// positionAt converts a byte offset to a 0-based (line, character) position.
+pub fn positionAt(text: string, offset: int) -> (int, int) {
+    if offset < 0 {
+        return 0, 0
+    }
+    if offset >= str.Len(text) {
+        offset = str.Len(text)
+    }
+    line := 0
+    lineStart := 0
+    for i := 0; i < offset; i = i + 1 {
+        if text[i] == 10 {
+            line = line + 1
+            lineStart = i + 1
+        }
+    }
+    return line, offset - lineStart
+}

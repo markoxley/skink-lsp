@@ -1,0 +1,233 @@
+// Module definition provides go-to-definition for the LSP server.
+//
+// It searches the document (and eventually the project) for the definition
+// of the symbol under the cursor, returning its location as an LSP Location.
+module definition
+
+import "std/json"
+import "std/str"
+import "std/lexer"
+import "std/parser"
+import "std/ast"
+import "lsp/documents"
+import "lsp/utils"
+
+// provide returns the definition location for the symbol at the given position.
+pub fn provide(dm: *documents.DocumentManager, params: json.Value) -> json.Value {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+    pos := json.ObjectGet(params, "position")
+    line := int(json.AsNumber(json.ObjectGet(pos, "line")))
+    character := int(json.AsNumber(json.ObjectGet(pos, "character")))
+
+    text, ok := documents.getText(dm, uri)
+    if !ok {
+        return json.Null()
+    }
+
+    // Find the word at the cursor position
+    word := utils.extractWordAt(text, line, character)
+    if str.Len(word) == 0 {
+        return json.Null()
+    }
+
+    // Tokenize and parse to find the definition
+    tokens := lexer.Tokenize(text)
+    p := parser.New(tokens)
+    decls := parser.ParseFile(&p)
+
+    // Search for the definition in declarations
+    defLine, defCol, found := findDefinition(decls, word)
+    if !found {
+        return json.Null()
+    }
+
+    // Build the Location response
+    rangeStart := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(defLine)), json.FromNumber(float(defCol))})
+    rangeEnd := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(defLine)), json.FromNumber(float(defCol) + str.Len(word))})
+    rangeVal := json.FromObject([]string{"start", "end"}, []json.Value{rangeStart, rangeEnd})
+    location := json.FromObject([]string{"uri", "range"}, []json.Value{json.FromString(uri), rangeVal})
+
+    return location
+}
+
+// findDefinition searches declarations for a symbol matching the given word.
+// Returns the 0-based line, column, and whether a definition was found.
+fn findDefinition(decls: []ast.Stmt, word: string) -> (int, int, bool) {
+    for i := 0; i < len(decls); i = i + 1 {
+        stmt := decls[i]
+        d := stmt.decl
+
+        // Declaration-kind checks use d.kind (the Decl's kind field).
+        // For top-level declarations (fn, struct, enum, etc.), stmt.decl
+        // is populated and d.kind is set to the corresponding ST_* constant.
+        // For module-level var declarations, both stmt.kind and d.kind are
+        // ST_VARDECL (24) — the check at the bottom uses stmt.kind for
+        // consistency with the statement-level var check in findVarDefinition.
+
+        // Check function declarations
+        if d.kind == ast.ST_FN && str.Equal(d.fnName, word) {
+            return stmt.line - 1, stmt.col - 1, true
+        }
+        // Check struct declarations
+        if d.kind == ast.ST_STRUCT && str.Equal(d.structName, word) {
+            return stmt.line - 1, stmt.col - 1, true
+        }
+        // Check enum declarations
+        if d.kind == ast.ST_ENUM && str.Equal(d.enumName, word) {
+            return stmt.line - 1, stmt.col - 1, true
+        }
+        // Check constants
+        if d.kind == ast.ST_CONST && str.Equal(d.constName, word) {
+            return stmt.line - 1, stmt.col - 1, true
+        }
+        // Check type aliases
+        if d.kind == ast.ST_TYPEALIAS && str.Equal(d.aliasName, word) {
+            return stmt.line - 1, stmt.col - 1, true
+        }
+        // Check module-level variable declarations.
+        // ST_VARDECL (24) is in the declaration range, so both stmt.kind
+        // and d.kind carry the same value for top-level var declarations.
+        if stmt.kind == ast.ST_VARDECL {
+            if str.Equal(stmt.varName, word) {
+                return stmt.line - 1, stmt.col - 1, true
+            }
+            for j := 0; j < len(stmt.varNames); j = j + 1 {
+                if str.Equal(stmt.varNames[j], word) {
+                    return stmt.line - 1, stmt.col - 1, true
+                }
+            }
+        }
+        // Check extern function declarations
+        if d.kind == ast.ST_EXTERN && str.Equal(d.fnName, word) {
+            return stmt.line - 1, stmt.col - 1, true
+        }
+        // Check template declarations
+        if d.kind == ast.ST_TEMPLATE && str.Equal(d.templateName, word) {
+            return stmt.line - 1, stmt.col - 1, true
+        }
+        // Check service declarations
+        if d.kind == ast.ST_SERVICE && str.Equal(d.serviceName, word) {
+            return stmt.line - 1, stmt.col - 1, true
+        }
+        // Check ruleset declarations
+        if d.kind == ast.ST_RULESET && str.Equal(d.rulesetName, word) {
+            return stmt.line - 1, stmt.col - 1, true
+        }
+        // Check struct fields
+        if d.kind == ast.ST_STRUCT {
+            for j := 0; j < len(d.structFields); j = j + 1 {
+                if str.Equal(d.structFields[j].name, word) {
+                    return stmt.line - 1, stmt.col - 1, true
+                }
+            }
+        }
+        // Check enum variants
+        if d.kind == ast.ST_ENUM {
+            for j := 0; j < len(d.enumVariants); j = j + 1 {
+                if str.Equal(d.enumVariants[j].name, word) {
+                    return stmt.line - 1, stmt.col - 1, true
+                }
+            }
+        }
+        // Check function parameters and local variables
+        if d.kind == ast.ST_FN {
+            for j := 0; j < len(d.fnParams); j = j + 1 {
+                if str.Equal(d.fnParams[j].name, word) {
+                    return stmt.line - 1, stmt.col - 1, true
+                }
+            }
+            // Search in function body for variable declarations
+            vline, vcol, vfound := findVarDefinition(d.fnBody, word)
+            if vfound {
+                return vline, vcol, true
+            }
+        }
+    }
+    return 0, 0, false
+}
+
+// findVarDefinition searches statements for a variable declaration matching word.
+fn findVarDefinition(stmts: []ast.Stmt, word: string) -> (int, int, bool) {
+    for i := 0; i < len(stmts); i = i + 1 {
+        stmt := stmts[i]
+        // Check variable declarations
+        if stmt.kind == ast.ST_VAR || stmt.kind == ast.ST_VARDECL {
+            if str.Equal(stmt.varName, word) {
+                return stmt.line - 1, stmt.col - 1, true
+            }
+            // Check multi-var declarations (tuple assign)
+            for j := 0; j < len(stmt.varNames); j = j + 1 {
+                if str.Equal(stmt.varNames[j], word) {
+                    return stmt.line - 1, stmt.col - 1, true
+                }
+            }
+        }
+        // Recurse into nested blocks
+        if len(stmt.thenBody) > 0 {
+            l, c, found := findVarDefinition(stmt.thenBody, word)
+            if found {
+                return l, c, true
+            }
+        }
+        if len(stmt.elseBody) > 0 {
+            l, c, found := findVarDefinition(stmt.elseBody, word)
+            if found {
+                return l, c, true
+            }
+        }
+        // Recurse into if-init (if x := expr; cond { })
+        if len(stmt.ifInit) > 0 {
+            l, c, found := findVarDefinition(stmt.ifInit, word)
+            if found {
+                return l, c, true
+            }
+        }
+        // Recurse into for loop init/body
+        if len(stmt.forInit) > 0 {
+            l, c, found := findVarDefinition(stmt.forInit, word)
+            if found {
+                return l, c, true
+            }
+        }
+        // Recurse into for loop post statements
+        if len(stmt.forPost) > 0 {
+            l, c, found := findVarDefinition(stmt.forPost, word)
+            if found {
+                return l, c, true
+            }
+        }
+        // Recurse into defer body
+        if len(stmt.deferStmt) > 0 {
+            l, c, found := findVarDefinition(stmt.deferStmt, word)
+            if found {
+                return l, c, true
+            }
+        }
+        // Recurse into match arms
+        for j := 0; j < len(stmt.matchArms); j = j + 1 {
+            arm := stmt.matchArms[j]
+            if len(arm.body) > 0 {
+                l, c, found := findVarDefinition(arm.body, word)
+                if found {
+                    return l, c, true
+                }
+            }
+        }
+        // Recurse into select/switch cases
+        for j := 0; j < len(stmt.selectCases); j = j + 1 {
+            sc := stmt.selectCases[j]
+            if len(sc.body) > 0 {
+                l, c, found := findVarDefinition(sc.body, word)
+                if found {
+                    return l, c, true
+                }
+            }
+        }
+    }
+    return 0, 0, false
+}
+
+
+
+

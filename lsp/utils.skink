@@ -1,0 +1,246 @@
+// Module utils provides shared utility functions for the LSP server.
+module utils
+
+import "std/str"
+import "std/fs"
+
+// extractWordAt finds the identifier word at the given 0-based line and column.
+//
+// The `character` parameter from LSP is a UTF-16 code-unit offset. For
+// ASCII text (the common case for Skink identifiers), byte offset == char
+// offset. For lines containing multibyte characters before the cursor,
+// we convert the character offset to a byte offset by counting UTF-8
+// lead bytes (bytes not matching 10xxxxxx, i.e. 0x80-0xBF are continuation).
+pub fn extractWordAt(text: string, line: int, character: int) -> string {
+    currentLine := 0
+    lineStart := 0
+    for i := 0; i < str.Len(text); i = i + 1 {
+        if currentLine == line {
+            lineStart = i
+            break
+        }
+        if text[i] == 10 {
+            currentLine = currentLine + 1
+        }
+    }
+    if currentLine < line {
+        return ""
+    }
+
+    lineEnd := lineStart
+    for lineEnd < str.Len(text) && text[lineEnd] != 10 {
+        lineEnd = lineEnd + 1
+    }
+
+    // Convert the UTF-16 character offset to a byte offset within the line.
+    // For ASCII text this is a no-op; for multibyte content it advances past
+    // continuation bytes. This is an approximation: true UTF-16 offsets would
+    // require counting surrogate pairs, but Skink identifiers are ASCII so
+    // the impact is limited to cursor positioning before multibyte content.
+    byteOffset := charToByteOffset(text, lineStart, lineEnd, character)
+    if byteOffset >= lineEnd {
+        return ""
+    }
+    wordStart := lineStart + byteOffset
+    wordEnd := wordStart
+
+    for wordStart > lineStart && isIdentChar(int(text[wordStart - 1])) {
+        wordStart = wordStart - 1
+    }
+    for wordEnd < lineEnd && isIdentChar(int(text[wordEnd])) {
+        wordEnd = wordEnd + 1
+    }
+
+    if wordEnd <= wordStart {
+        return ""
+    }
+    return str.Substr(text, wordStart, wordEnd - wordStart)
+}
+
+// charToByteOffset converts a UTF-16 character offset to a byte offset
+// within the substring text[start:end]. It counts characters by skipping
+// UTF-8 continuation bytes (0x80-0xBF). For ASCII text, byte offset equals
+// character offset. For multibyte content, each multi-byte sequence counts
+// as one character, so the byte offset will be >= the character offset.
+fn charToByteOffset(text: string, start: int, end: int, charOffset: int) -> int {
+    byteOff := 0
+    chars := 0
+    i := start
+    for i < end && chars < charOffset {
+        b := int(text[i])
+        // A UTF-8 lead byte or ASCII byte starts a new character.
+        // Continuation bytes (0x80-0xBF) are part of the current character.
+        if b < 128 || b >= 192 {
+            chars = chars + 1
+        }
+        byteOff = byteOff + 1
+        i = i + 1
+    }
+    return byteOff
+}
+
+// wordBeforeAt returns the identifier fragment immediately before the cursor
+// plus the raw line text preceding that fragment.
+//
+// Returns (word, before):
+//   - word:   the trailing run of identifier characters ending at the cursor
+//             ("" if the cursor is not at the end of an identifier)
+//   - before: the line text from column 0 up to the start of word
+//
+// This is what completion should filter against — NOT the whole line prefix.
+// Filtering on the full trimmed line (e.g. "x := str.Con") matches nothing
+// and was the cause of missing autocomplete.
+pub fn wordBeforeAt(text: string, line: int, character: int) -> (string, string) {
+    currentLine := 0
+    lineStart := 0
+    for i := 0; i < str.Len(text); i = i + 1 {
+        if currentLine == line {
+            lineStart = i
+            break
+        }
+        if text[i] == 10 {
+            currentLine = currentLine + 1
+        }
+    }
+    if currentLine < line {
+        return "", ""
+    }
+
+    lineEnd := lineStart
+    for lineEnd < str.Len(text) && text[lineEnd] != 10 {
+        lineEnd = lineEnd + 1
+    }
+
+    // Convert the UTF-16 character offset to a byte offset (see extractWordAt).
+    byteOffset := charToByteOffset(text, lineStart, lineEnd, character)
+    wordEnd := lineStart + byteOffset
+    if wordEnd > lineEnd {
+        wordEnd = lineEnd
+    }
+
+    wordStart := wordEnd
+    for wordStart > lineStart && isIdentChar(int(text[wordStart - 1])) {
+        wordStart = wordStart - 1
+    }
+
+    word := str.Substr(text, wordStart, wordEnd - wordStart)
+    before := str.Substr(text, lineStart, wordStart - lineStart)
+    return word, before
+}
+
+// trailingIdent returns the identifier fragment at the end of s, or ""
+// if s does not end with an identifier character.
+pub fn trailingIdent(s: string) -> string {
+    n := str.Len(s)
+    i := n
+    for i > 0 && isIdentChar(int(s[i - 1])) {
+        i = i - 1
+    }
+    return str.Substr(s, i, n - i)
+}
+
+// dirOf returns the directory portion of a file path (everything up to the
+// last '/'). Returns "." if there is no '/'.
+pub fn dirOf(p: string) -> string {
+    idx := lastSlash(p)
+    if idx < 0 {
+        return "."
+    }
+    return str.Substr(p, 0, idx)
+}
+
+// baseName returns the final path component (text after the last '/').
+pub fn baseName(p: string) -> string {
+    idx := lastSlash(p)
+    if idx < 0 {
+        return p
+    }
+    return str.Substr(p, idx + 1, str.Len(p) - idx - 1)
+}
+
+// joinPath joins a directory and file name with a '/' separator.
+pub fn joinPath(dir: string, name: string) -> string {
+    if str.Len(dir) == 0 || str.Equal(dir, ".") {
+        return name
+    }
+    if dir[str.Len(dir) - 1] == 47 { // ends with '/'
+        return str.Concat(dir, name)
+    }
+    return str.Concat(str.Concat(dir, "/"), name)
+}
+
+// lastSlash returns the index of the last '/' in p, or -1 if none.
+fn lastSlash(p: string) -> int {
+    i := str.Len(p) - 1
+    for i >= 0 {
+        if p[i] == 47 { // '/'
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// fileExists reports whether path names a readable file.
+pub fn fileExists(path: string) -> bool {
+    return fs.Exists(path)
+}
+
+// readFileText reads an entire file, returning "" on failure.
+pub fn readFileText(path: string) -> string {
+    data, err := fs.ReadAll(path)
+    if err.message != "" {
+        return ""
+    }
+    return data
+}
+
+pub fn isIdentChar(c: int) -> bool {
+    if c >= 97 && c <= 122 { return true }
+    if c >= 65 && c <= 90  { return true }
+    if c >= 48 && c <= 57  { return true }
+    if c == 95 { return true }
+    return false
+}
+
+pub fn isIdentStart(c: int) -> bool {
+    if c >= 97 && c <= 122 { return true }
+    if c >= 65 && c <= 90  { return true }
+    if c == 95 { return true }
+    return false
+}
+
+// intToStr converts an integer to a string.
+pub fn intToStr(n: int) -> string {
+    if n == 0 {
+        return "0"
+    }
+    neg := false
+    if n < 0 {
+        neg = true
+        n = -n
+    }
+    result := ""
+    for n > 0 {
+        d := n % 10
+        result = str.Concat(charForDigit(d), result)
+        n = n / 10
+    }
+    if neg {
+        result = str.Concat("-", result)
+    }
+    return result
+}
+
+pub fn charForDigit(d: int) -> string {
+    if d == 0 { return "0" }
+    if d == 1 { return "1" }
+    if d == 2 { return "2" }
+    if d == 3 { return "3" }
+    if d == 4 { return "4" }
+    if d == 5 { return "5" }
+    if d == 6 { return "6" }
+    if d == 7 { return "7" }
+    if d == 8 { return "8" }
+    return "9"
+}

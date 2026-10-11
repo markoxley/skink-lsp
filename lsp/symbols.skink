@@ -1,0 +1,366 @@
+// Module symbols provides document symbol information for the LSP server.
+//
+// It parses the document and extracts function, struct, enum, constant,
+// and type declarations as LSP DocumentSymbol objects.
+module symbols
+
+import "std/json"
+import "std/str"
+import "std/libc"
+import "std/lexer"
+import "std/parser"
+import "std/ast"
+import "lsp/documents"
+
+// provide returns document symbols for the given text document.
+pub fn provide(dm: *documents.DocumentManager, params: json.Value) -> json.Value {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+
+    text, ok := documents.getText(dm, uri)
+    if !ok {
+        return json.FromArray([]json.Value{})
+    }
+
+    // Tokenize and parse the document
+    tokens := lexer.Tokenize(text)
+    p := parser.New(tokens)
+    decls := parser.ParseFile(&p)
+
+    var symbols []json.Value
+    for i := 0; i < len(decls); i = i + 1 {
+        sym := declToSymbol(decls[i])
+        if sym.kind != 0 {
+            symbols = append(symbols, symToJson(sym))
+        }
+    }
+
+    return json.FromArray(symbols)
+}
+
+// SymbolInfo is an intermediate representation of a document symbol.
+struct SymbolInfo {
+    name: string
+    kind: int       // LSP SymbolKind
+    line: int       // 0-based start line
+    col: int        // 0-based start column
+    endLine: int    // 0-based end line
+    endCol: int     // 0-based end column
+    detail: string
+    children: []SymbolInfo
+}
+
+// declToSymbol converts an AST declaration to a SymbolInfo.
+fn declToSymbol(decl: ast.Stmt) -> SymbolInfo {
+    d := decl.decl
+    if d.kind == ast.ST_FN {
+        name := d.fnName
+        if !d.fnIsPub && len(d.fnReceiver) > 0 {
+            // Method — prefix with receiver type
+            receiverType := ast.typeString(d.fnReceiver[0])
+            name = str.Concat(str.Concat(receiverType, "."), name)
+        }
+        detail := buildFnSignature(d)
+        return SymbolInfo{
+            name: name,
+            kind: 12,  // Function
+            line: decl.line - 1,
+            col: decl.col - 1,
+            endLine: decl.line - 1,
+            endCol: decl.col - 1 + str.Len(name),
+            detail: detail,
+            children: []SymbolInfo{},
+        }
+    }
+    if d.kind == ast.ST_STRUCT {
+        children := fieldSymbols(d.structFields, 23)  // Field = 23
+        return SymbolInfo{
+            name: d.structName,
+            kind: 23,  // Struct
+            line: decl.line - 1,
+            col: decl.col - 1,
+            endLine: decl.line - 1,
+            endCol: decl.col - 1 + str.Len(d.structName),
+            detail: "struct",
+            children: children,
+        }
+    }
+    if d.kind == ast.ST_ENUM {
+        children := variantSymbols(d.enumVariants)
+        return SymbolInfo{
+            name: d.enumName,
+            kind: 10,  // Enum
+            line: decl.line - 1,
+            col: decl.col - 1,
+            endLine: decl.line - 1,
+            endCol: decl.col - 1 + str.Len(d.enumName),
+            detail: "enum",
+            children: children,
+        }
+    }
+    if d.kind == ast.ST_CONST {
+        if str.Len(d.constName) > 0 {
+            return SymbolInfo{
+                name: d.constName,
+                kind: 14,  // Constant
+                line: decl.line - 1,
+                col: decl.col - 1,
+                endLine: decl.line - 1,
+                endCol: decl.col - 1 + str.Len(d.constName),
+                detail: "const",
+                children: []SymbolInfo{},
+            }
+        }
+        // Const block — return first item as representative
+        if len(d.constBlock) > 0 {
+            return SymbolInfo{
+                name: d.constBlock[0].name,
+                kind: 14,
+                line: decl.line - 1,
+                col: decl.col - 1,
+                endLine: decl.line - 1,
+                endCol: decl.col - 1 + str.Len(d.constBlock[0].name),
+                detail: "const block",
+                children: []SymbolInfo{},
+            }
+        }
+    }
+    if d.kind == ast.ST_TYPEALIAS {
+        return SymbolInfo{
+            name: d.aliasName,
+            kind: 23,  // Struct (type)
+            line: decl.line - 1,
+            col: decl.col - 1,
+            endLine: decl.line - 1,
+            endCol: decl.col - 1 + str.Len(d.aliasName),
+            detail: "type alias",
+            children: []SymbolInfo{},
+        }
+    }
+    if d.kind == ast.ST_MODULE {
+        return SymbolInfo{
+            name: d.moduleName,
+            kind: 2,  // Module
+            line: decl.line - 1,
+            col: decl.col - 1,
+            endLine: decl.line - 1,
+            endCol: decl.col - 1 + str.Len(d.moduleName),
+            detail: "module",
+            children: []SymbolInfo{},
+        }
+    }
+    if d.kind == ast.ST_IMPORT {
+        return SymbolInfo{
+            name: d.importPath,
+            kind: 9,  // Package
+            line: decl.line - 1,
+            col: decl.col - 1,
+            endLine: decl.line - 1,
+            endCol: decl.col - 1 + str.Len(d.importPath),
+            detail: "import",
+            children: []SymbolInfo{},
+        }
+    }
+    if decl.kind == ast.ST_VARDECL && str.Len(decl.varName) > 0 {
+        return SymbolInfo{
+            name: decl.varName,
+            kind: 13,  // Variable
+            line: decl.line - 1,
+            col: decl.col - 1,
+            endLine: decl.line - 1,
+            endCol: decl.col - 1 + str.Len(decl.varName),
+            detail: "var",
+            children: []SymbolInfo{},
+        }
+    }
+    if d.kind == ast.ST_EXTERN {
+        return SymbolInfo{
+            name: d.fnName,
+            kind: 12,  // Function
+            line: decl.line - 1,
+            col: decl.col - 1,
+            endLine: decl.line - 1,
+            endCol: decl.col - 1 + str.Len(d.fnName),
+            detail: "extern fn",
+            children: []SymbolInfo{},
+        }
+    }
+    if d.kind == ast.ST_TEMPLATE {
+        return SymbolInfo{
+            name: d.templateName,
+            kind: 11,  // Interface
+            line: decl.line - 1,
+            col: decl.col - 1,
+            endLine: decl.line - 1,
+            endCol: decl.col - 1 + str.Len(d.templateName),
+            detail: "template",
+            children: methodSymbols(d.templateMethods),
+        }
+    }
+    if d.kind == ast.ST_SERVICE {
+        detail := "service"
+        if str.Len(d.serviceForType) > 0 {
+            detail = str.Concat(detail, str.Concat(" for ", d.serviceForType))
+        }
+        return SymbolInfo{
+            name: d.serviceName,
+            kind: 11,  // Interface
+            line: decl.line - 1,
+            col: decl.col - 1,
+            endLine: decl.line - 1,
+            endCol: decl.col - 1 + str.Len(d.serviceName),
+            detail: detail,
+            children: methodSymbols(d.serviceMethods),
+        }
+    }
+    if d.kind == ast.ST_RULESET {
+        return SymbolInfo{
+            name: d.rulesetName,
+            kind: 3,  // Namespace
+            line: decl.line - 1,
+            col: decl.col - 1,
+            endLine: decl.line - 1,
+            endCol: decl.col - 1 + str.Len(d.rulesetName),
+            detail: "ruleset",
+            children: ruleSymbols(d.rulesetRules),
+        }
+    }
+    return SymbolInfo{}
+}
+
+// methodSymbols converts method declarations (from templates and services)
+// to child SymbolInfo objects.
+fn methodSymbols(methods: []ast.Decl) -> []SymbolInfo {
+    var children []SymbolInfo
+    for i := 0; i < len(methods); i = i + 1 {
+        m := methods[i]
+        children = append(children, SymbolInfo{
+            name: m.fnName,
+            kind: 6,  // Method
+            line: 0,
+            col: 0,
+            endLine: 0,
+            endCol: str.Len(m.fnName),
+            detail: buildFnSignature(m),
+            children: []SymbolInfo{},
+        })
+    }
+    return children
+}
+
+// ruleSymbols converts ruleset rules to child SymbolInfo objects.
+fn ruleSymbols(rules: []ast.RuleDecl) -> []SymbolInfo {
+    var children []SymbolInfo
+    for i := 0; i < len(rules); i = i + 1 {
+        r := rules[i]
+        children = append(children, SymbolInfo{
+            name: r.name,
+            kind: 24,  // Event
+            line: 0,
+            col: 0,
+            endLine: 0,
+            endCol: str.Len(r.name),
+            detail: "rule",
+            children: []SymbolInfo{},
+        })
+    }
+    return children
+}
+
+// fieldSymbols converts struct fields to child SymbolInfo objects.
+fn fieldSymbols(fields: []ast.Field, kind: int) -> []SymbolInfo {
+    var children []SymbolInfo
+    for i := 0; i < len(fields); i = i + 1 {
+        f := fields[i]
+        child := SymbolInfo{
+            name: f.name,
+            kind: 8,  // Field
+            line: 0,
+            col: 0,
+            endLine: 0,
+            endCol: str.Len(f.name),
+            detail: "field",
+            children: []SymbolInfo{},
+        }
+        children = append(children, child)
+    }
+    return children
+}
+
+// variantSymbols converts enum variants to child SymbolInfo objects.
+fn variantSymbols(variants: []ast.Variant) -> []SymbolInfo {
+    var children []SymbolInfo
+    for i := 0; i < len(variants); i = i + 1 {
+        v := variants[i]
+        child := SymbolInfo{
+            name: v.name,
+            kind: 22,  // EnumMember
+            line: 0,
+            col: 0,
+            endLine: 0,
+            endCol: str.Len(v.name),
+            detail: "variant",
+            children: []SymbolInfo{},
+        }
+        children = append(children, child)
+    }
+    return children
+}
+
+// buildFnSignature builds a function signature string from an AST declaration.
+fn buildFnSignature(d: ast.Decl) -> string {
+    sig := "fn "
+    if d.fnIsPub {
+        sig = str.Concat("pub ", sig)
+    }
+    sig = str.Concat(sig, d.fnName)
+    sig = str.Concat(sig, "(")
+    for i := 0; i < len(d.fnParams); i = i + 1 {
+        if i > 0 {
+            sig = str.Concat(sig, ", ")
+        }
+        sig = str.Concat(sig, d.fnParams[i].name)
+        if len(d.fnParams[i].typ) > 0 {
+            sig = str.Concat(sig, ": ")
+            sig = str.Concat(sig, ast.typeString(d.fnParams[i].typ[0]))
+        }
+    }
+    sig = str.Concat(sig, ")")
+    if len(d.fnRetTypes) > 0 {
+        sig = str.Concat(sig, " -> ")
+        for i := 0; i < len(d.fnRetTypes); i = i + 1 {
+            if i > 0 {
+                sig = str.Concat(sig, ", ")
+            }
+            sig = str.Concat(sig, ast.typeString(d.fnRetTypes[i]))
+        }
+    }
+    return sig
+}
+
+// symToJson converts a SymbolInfo to an LSP DocumentSymbol JSON object.
+fn symToJson(sym: SymbolInfo) -> json.Value {
+    rangeStart := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(sym.line)), json.FromNumber(float(sym.col))})
+    rangeEnd := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(sym.endLine)), json.FromNumber(float(sym.endCol))})
+    rangeVal := json.FromObject([]string{"start", "end"}, []json.Value{rangeStart, rangeEnd})
+    selectionRange := rangeVal
+
+    var children []json.Value
+    for i := 0; i < len(sym.children); i = i + 1 {
+        children = append(children, symToJson(sym.children[i]))
+    }
+
+    keys := []string{"name", "kind", "range", "selectionRange", "detail", "children"}
+    vals := []json.Value{
+        json.FromString(sym.name),
+        json.FromNumber(float(sym.kind)),
+        rangeVal,
+        selectionRange,
+        json.FromString(sym.detail),
+        json.FromArray(children),
+    }
+    return json.FromObject(keys, vals)
+}
+
+
+

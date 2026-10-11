@@ -1,0 +1,1487 @@
+// Module formatting provides document formatting for the LSP server.
+//
+// It implements a canonical, gofmt-style formatter for Skink. The formatter
+// works on the token stream from the compiler's own lexer, so brackets and
+// operators inside string literals and comments never affect layout:
+//
+//   - consistent bracket-aware indentation (LSP FormattingOptions drive
+//     indent size and tabs-vs-spaces)
+//   - Go-style operator spacing (a+b → a + b, x:=1 → x := 1, unary ops
+//     bind tight: -x, *p, &v, <-ch, !b)
+//   - tight punctuation (f(x, y), a[i], T{field: v}, chan<T>)
+//   - generic <...> vs comparison </> disambiguation by lookahead
+//   - "} else {" joins, collapsed blank lines (max 1, none after '{' or
+//     before '}'), case/default dedent one level inside switch/select
+//   - gofmt tabwriter-style alignment of "name: value" columns and
+//     trailing comments in struct decls / composite literals / map literals
+//   - trailing whitespace trimmed, single trailing newline ensured
+//
+// Three LSP entry points are provided:
+//   provide        → textDocument/formatting        (whole document)
+//   provideRange   → textDocument/rangeFormatting   (needed by VS Code's
+//                     formatOnSaveMode:"modifications" and formatOnPaste)
+//   provideOnType  → textDocument/onTypeFormatting  (editor.formatOnType)
+module formatting
+
+import "std/json"
+import "std/str"
+import "std/lexer"
+import "std/buf"
+import "lsp/documents"
+
+// ─── LSP entry points ────────────────────────────────────────────────────
+
+// provide returns text edits that format the whole document.
+//
+// The request's "options" field (FormattingOptions) carries tabSize and
+// insertSpaces, which we honor. trimTrailingWhitespace and
+// ensureFinalNewline are always on (gofmt does both unconditionally).
+pub fn provide(dm: *documents.DocumentManager, params: json.Value) -> json.Value {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+
+    indentSize, insertSpaces := formatOptions(params)
+
+    text, ok := documents.getText(dm, uri)
+    if !ok {
+        return json.Null()
+    }
+
+    formatted := Format(text, indentSize, insertSpaces)
+    if str.Equal(text, formatted) {
+        return json.FromArray([]json.Value{})
+    }
+    return json.FromArray([]json.Value{wholeDocEdit(text, formatted)})
+}
+
+// provideRange returns text edits that format only the lines intersecting
+// the requested range. The whole document is reformatted (indentation is
+// context-sensitive), but the emitted edits are restricted to changed lines
+// inside the range — matching how VS Code drives formatOnSaveMode:
+// "modifications" (one request per modified range) and formatOnPaste.
+pub fn provideRange(dm: *documents.DocumentManager, params: json.Value) -> json.Value {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+
+    indentSize, insertSpaces := formatOptions(params)
+
+    rng := json.ObjectGet(params, "range")
+    startLine := int(json.AsNumber(json.ObjectGet(json.ObjectGet(rng, "start"), "line")))
+    endLine := int(json.AsNumber(json.ObjectGet(json.ObjectGet(rng, "end"), "line")))
+
+    text, ok := documents.getText(dm, uri)
+    if !ok {
+        return json.Null()
+    }
+
+    formatted := Format(text, indentSize, insertSpaces)
+    if str.Equal(text, formatted) {
+        return json.FromArray([]json.Value{})
+    }
+    return diffEditsInRange(text, formatted, startLine, endLine)
+}
+
+// provideOnType reformats the document and returns edits only for the line
+// containing the trigger position (the line where the user just typed the
+// trigger character, e.g. '}'). This re-indents the closing-bracket line
+// exactly like the language-configuration indentation rules, but from the
+// authoritative canonical layout.
+pub fn provideOnType(dm: *documents.DocumentManager, params: json.Value) -> json.Value {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+
+    indentSize, insertSpaces := formatOptions(params)
+
+    pos := json.ObjectGet(params, "position")
+    line := int(json.AsNumber(json.ObjectGet(pos, "line")))
+
+    text, ok := documents.getText(dm, uri)
+    if !ok {
+        return json.Null()
+    }
+
+    formatted := Format(text, indentSize, insertSpaces)
+    if str.Equal(text, formatted) {
+        return json.FromArray([]json.Value{})
+    }
+    return diffEditsInRange(text, formatted, line, line)
+}
+
+// formatOptions extracts FormattingOptions {tabSize, insertSpaces} from the
+// request params. Defaults: 4 spaces.
+fn formatOptions(params: json.Value) -> (int, bool) {
+    indentSize := 4
+    insertSpaces := true
+    optionsVal := json.ObjectGet(params, "options")
+    if optionsVal.kind == 5 { // JSON object
+        tabSizeVal := json.ObjectGet(optionsVal, "tabSize")
+        if tabSizeVal.kind == 2 { // number
+            indentSize = int(json.AsNumber(tabSizeVal))
+            if indentSize < 1 {
+                indentSize = 4
+            }
+        }
+        insertSpacesVal := json.ObjectGet(optionsVal, "insertSpaces")
+        if insertSpacesVal.kind == 1 { // bool
+            insertSpaces = json.AsBool(insertSpacesVal)
+        }
+    }
+    return indentSize, insertSpaces
+}
+
+// wholeDocEdit returns a single TextEdit replacing the entire document.
+fn wholeDocEdit(text: string, formatted: string) -> json.Value {
+    lineCount := documents.lineCount(text)
+    rangeStart := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(0)), json.FromNumber(float(0))})
+    rangeEnd := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(lineCount)), json.FromNumber(float(0))})
+    rangeVal := json.FromObject([]string{"start", "end"}, []json.Value{rangeStart, rangeEnd})
+    return json.FromObject([]string{"range", "newText"}, []json.Value{rangeVal, json.FromString(formatted)})
+}
+
+// diffEditsInRange emits per-run TextEdits for lines inside [startLine,
+// endLine] whose formatted version differs. If the line count changed the
+// edit degrades to a whole-document replacement (same as provide()).
+fn diffEditsInRange(text: string, formatted: string, startLine: int, endLine: int) -> json.Value {
+    oLines := str.Split(text, "\n")
+    fLines := str.Split(formatted, "\n")
+
+    if len(oLines) != len(fLines) {
+        return json.FromArray([]json.Value{wholeDocEdit(text, formatted)})
+    }
+
+    var edits []json.Value
+    i := startLine
+    for i <= endLine && i < len(fLines) {
+        if str.Equal(oLines[i], fLines[i]) {
+            i = i + 1
+            continue
+        }
+        // Collect the contiguous run of changed lines [a..b].
+        a := i
+        for i <= endLine && i < len(fLines) && !str.Equal(oLines[i], fLines[i]) {
+            i = i + 1
+        }
+        b := i - 1
+
+        rangeStart := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(a)), json.FromNumber(float(0))})
+        rangeEnd := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(b)), json.FromNumber(float(str.Len(oLines[b])))})
+        rangeVal := json.FromObject([]string{"start", "end"}, []json.Value{rangeStart, rangeEnd})
+
+        // Join the replacement lines manually (no slice-expr for sub-arrays).
+        newText := fLines[a]
+        for j := a + 1; j <= b; j = j + 1 {
+            newText = str.Concat(newText, str.Concat("\n", fLines[j]))
+        }
+        edits = append(edits, json.FromObject([]string{"range", "newText"}, []json.Value{rangeVal, json.FromString(newText)}))
+    }
+    return json.FromArray(edits)
+}
+
+// ─── Canonical formatter ─────────────────────────────────────────────────
+
+// Format formats the given source text and returns the canonical form.
+// indentSize controls spaces per indent level; insertSpaces selects spaces
+// (true) over tabs (false). This is the same canonical formatter used by
+// the LSP formatting providers and the skinkfmt CLI.
+pub fn Format(text: string, indentSize: int, insertSpaces: bool) -> string {
+    if str.Len(str.Trim(text)) == 0 {
+        return text
+    }
+    lines := emitLines(text, indentSize, insertSpaces)
+    lines = alignFieldColumns(lines)
+    result := str.Join(lines, "\n")
+    if str.Len(result) > 0 && result[str.Len(result) - 1] != 10 {
+        result = str.Concat(result, "\n")
+    }
+    return result
+}
+
+// emitLines runs the token-level layout pass and returns formatted lines
+// (without a trailing newline). Tokens that span multiple physical lines
+// (block comments, backtick strings) keep their internal newlines inside
+// the emitted line string.
+fn emitLines(text: string, indentSize: int, insertSpaces: bool) -> []string {
+    toks := lexer.Tokenize(text)
+    n := len(toks)
+
+    // Pre-pass: mark which '<' / '>' tokens are generic angle brackets
+    // (chan<T>, Map<K, V>) versus comparison operators (a < b).
+    genOpen := boolSlice(n)
+    genClose := boolSlice(n)
+    markGenerics(toks, genOpen, genClose)
+
+    // Pre-pass: mark slice ':' tokens that gofmt spaces (s[lo+1 : hi-1]).
+    spacedColon := boolSlice(n)
+    markSliceColons(toks, genOpen, genClose, spacedColon)
+
+    // Line start byte offsets for raw string-literal recovery.
+    lineStarts := lineStartOffsets(text)
+
+    var lines []string
+    out := buf.NewBuffer()
+    lineStartPending := true // next emitted token starts a fresh line
+    depth := 0               // open bracket depth ({[()
+    indexDepth := 0          // enclosing index/slice '[' count
+    expectOperand := true    // next token may begin an operand
+    prevWasUnary := false    // previous token was a unary operator (-, *, &, !, <-)
+    prevTightOp := false     // previous token was a tight binary op (inside index)
+    prevSliceColon := 0      // previous ':' inside index: 0 none, 1 tight, 2 spaced
+    prevMarkedClose := false // previous token was a generic '>'
+    prevMarkedOpen := false  // previous token was a generic '<'
+    prevGenCloseCtx := false // operand-context flag recorded at the generic '<'
+    prevTypeClose := false   // previous token was ']' closing a type bracket
+    prevTypeCtx := false     // operand-context flag recorded at that '['
+    prevBlockBrace := false  // previous token was a block '{'
+    chainCtx := false        // operand context of the root of a '.x' chain
+    pendingBlock := false    // a block-opening '{' is expected at pendingBlockDepth
+    pendingBlockDepth := 0
+    lastCovered := 0         // last source line fully emitted (handles multi-line tokens)
+    prevKind := -1
+    prevPrevKind := -1
+
+    // brStack tracks open brackets: 0='('/'{', 1=type '[', 2=index '['.
+    // brCtx is parallel: for each '[' whether the bracket chain sits in
+    // operand context (governs '{': 'x := []T{' tight vs '-> []T {' spaced).
+    // genCtx similarly tracks operand context for generic '<'.
+    var brStack []int
+    var brCtx []bool
+    var genCtx []bool
+
+    for i := 0; i < n; i = i + 1 {
+        tok := toks[i]
+        ck := tok.kind
+        if ck == lexer.T_NEWLINE || ck == lexer.T_EOF {
+            continue
+        }
+
+        // Line break? Tokens carry 1-based source line numbers.
+        if lastCovered > 0 && tok.line > lastCovered {
+            // gofmt joins "} else {" — keep else on the '}' line.
+            joinElse := ck == lexer.T_ELSE && prevKind == lexer.T_RBRACE
+            if !joinElse {
+                lines = pushLine(lines, &out)
+                gap := tok.line - lastCovered
+                if gap > 1 && !opensBlock(prevKind) && !isCloser(ck) {
+                    // Collapse any run of blank lines to one; none right
+                    // after an opening bracket or before a closing one.
+                    lines = append(lines, "")
+                }
+                lineStartPending = true
+            }
+        }
+
+        // Classify this '{' (composite literal vs block) and this '}'
+        // (block close vs composite close) before spacing: gofmt uses
+        // '{ stmt }' inside block braces but 'T{x: 1}' inside literals.
+        compositeOpen := false
+        if ck == lexer.T_LBRACE {
+            if prevKind == lexer.T_IDENT || isTypeToken(prevKind) {
+                if prevPrevKind == lexer.T_DOT {
+                    compositeOpen = chainCtx
+                } else if prevPrevKind == lexer.T_RBRACKET {
+                    compositeOpen = prevTypeCtx
+                } else {
+                    compositeOpen = isOperandCtx(prevPrevKind)
+                }
+            } else if prevKind == lexer.T_RBRACKET {
+                compositeOpen = prevTypeCtx
+            } else if prevKind == lexer.T_GT && prevMarkedClose {
+                compositeOpen = prevGenCloseCtx
+            } else if prevKind == lexer.T_LBRACE || prevKind == lexer.T_COMMA || prevKind == lexer.T_COLON || prevKind == lexer.T_LPAREN {
+                // '{{...}}', 'K: {v}', 'f({x: 1})' — literal positions.
+                compositeOpen = true
+            }
+        }
+        // A '{' is a block brace when it isn't a composite literal — or
+        // when a pending control-flow keyword at this depth forces it:
+        // 'if x == y {' wins over the 'x == T{' composite reading, since
+        // a bare composite literal can't end a condition.
+        blockBrace := ck == lexer.T_LBRACE && (!compositeOpen || (pendingBlock && depth == pendingBlockDepth))
+        thisCloseBlock := ck == lexer.T_RBRACE && len(brStack) > 0 && brStack[len(brStack) - 1] == 0 && brCtx[len(brCtx) - 1]
+
+        if lineStartPending {
+            // Leading closers dedent (line starting with '}' or '}}');
+            // case/default dedent one level inside switch/select.
+            lvl := depth - countLeadingClosers(toks, i)
+            if ck == lexer.T_CASE || ck == lexer.T_DEFAULT {
+                lvl = lvl - 1
+            }
+            if lvl < 0 {
+                lvl = 0
+            }
+            out.WriteString(makeIndent(lvl, indentSize, insertSpaces))
+            lineStartPending = false
+        } else {
+            if needSpace(prevKind, prevPrevKind, ck, genOpen[i], genClose[i], prevMarkedClose, prevGenCloseCtx, prevMarkedOpen, prevTypeClose, prevTypeCtx, chainCtx, expectOperand, prevWasUnary, prevTightOp, prevSliceColon, spacedColon[i], indexDepth, blockBrace, prevBlockBrace, thisCloseBlock) {
+                out.WriteString(" ")
+            }
+        }
+
+        // Emit the token text verbatim. T_STRING literals are stored
+        // unescaped and unquoted by the lexer, so the raw source text is
+        // recovered from the token's line/col position instead.
+        emitted := tok.literal
+        if ck == lexer.T_STRING {
+            emitted = rawStringAt(text, lineStarts, tok.line, tok.col)
+        }
+        out.WriteString(emitted)
+        lastCovered = tok.line + countNewlines(emitted)
+
+        // Track bracket depth and the bracket-kind/context stacks.
+        if ck == lexer.T_LPAREN || ck == lexer.T_LBRACE {
+            depth = depth + 1
+            brStack = append(brStack, 0)
+            // brCtx doubles as a block-literal flag for '{' entries:
+            // the matching '}' uses it for '{ stmt }' inner spacing.
+            brCtx = append(brCtx, ck == lexer.T_LBRACE && blockBrace)
+            if ck == lexer.T_LBRACE && depth == pendingBlockDepth + 1 {
+                pendingBlock = false // the pending block brace was consumed
+            }
+        } else if ck == lexer.T_LBRACKET {
+            depth = depth + 1
+            // Operand context for the type-expression this '[' belongs to:
+            // '[]T'/'[][]T' chains inherit the root context, 'map[K]V'
+            // consults the token before 'map', others use the token
+            // before the '[' itself.
+            ctx := false
+            if prevTypeClose {
+                ctx = prevTypeCtx
+            } else if prevKind == lexer.T_MAP || prevKind == lexer.T_SET || prevKind == lexer.T_CHAN || prevKind == lexer.T_TENSOR {
+                ctx = isOperandCtx(prevPrevKind)
+            } else {
+                ctx = isOperandCtx(prevKind)
+            }
+            if isIndexBracket(prevKind, prevPrevKind, prevMarkedClose, prevTypeClose) {
+                brStack = append(brStack, 2)
+                indexDepth = indexDepth + 1
+            } else {
+                brStack = append(brStack, 1)
+            }
+            brCtx = append(brCtx, ctx)
+        } else if isCloser(ck) {
+            depth = depth - 1
+            if depth < 0 {
+                depth = 0
+            }
+            if len(brStack) > 0 {
+                top := brStack[len(brStack) - 1]
+                if top == 2 {
+                    indexDepth = indexDepth - 1
+                    if indexDepth < 0 {
+                        indexDepth = 0
+                    }
+                }
+                prevTypeClose = ck == lexer.T_RBRACKET && top == 1
+                prevTypeCtx = top == 1 && brCtx[len(brCtx) - 1]
+                brStack = brStack[:len(brStack) - 1]
+                brCtx = brCtx[:len(brCtx) - 1]
+            }
+        }
+
+        // Track operand context for generic '<' ... '>' spans so '{'
+        // after 'Set[T]' can tell 'x := Set[T]{' from '-> Set[T] {'.
+        if ck == lexer.T_LT && genOpen[i] {
+            genCtx = append(genCtx, isOperandCtx(prevPrevKind))
+        }
+        if ck == lexer.T_GT && genClose[i] {
+            if len(genCtx) > 0 {
+                prevGenCloseCtx = genCtx[len(genCtx) - 1]
+                genCtx = genCtx[:len(genCtx) - 1]
+            } else {
+                prevGenCloseCtx = false
+            }
+        }
+
+        // Unary vs binary operators: an operator-capable token in operand
+        // position is unary (binds tight to what follows). A binary
+        // operator inside an index bracket prints tight (a[i-1]).
+        thisUnary := false
+        if isUnaryCapable(ck) && expectOperand {
+            thisUnary = true
+        }
+        thisTightOp := indexDepth > 0 && !expectOperand && isArithOp(ck)
+
+        // Keywords that open a '{' block expect a block brace at the
+        // current depth. ('case'/'default' use ':' bodies, not braces.)
+        if isBlockKeyword(ck) {
+            pendingBlock = true
+            pendingBlockDepth = depth
+        }
+
+        // Track operand context for '.'-chained identifiers: 'pkg.T{'
+        // binds tight only when the chain root sits in operand context
+        // ('x := pkg.T{' vs 'if s.Empty {'). An identifier continuing a
+        // chain (previous token '.') inherits the chain's context.
+        if ck == lexer.T_IDENT && prevKind != lexer.T_DOT {
+            if prevKind == lexer.T_LPAREN {
+                chainCtx = isOperandCtx(prevPrevKind)
+            } else {
+                chainCtx = isOperandCtx(prevKind)
+            }
+        }
+
+        // Operand expectation for the NEXT token (comments are transparent).
+        if ck != lexer.T_COMMENT && ck != lexer.T_DOC {
+            expectOperand = !closesOperand(ck, genClose[i])
+            prevPrevKind = prevKind
+            prevKind = ck
+            prevWasUnary = thisUnary
+            prevTightOp = thisTightOp
+            prevMarkedClose = ck == lexer.T_GT && genClose[i]
+            prevMarkedOpen = ck == lexer.T_LT && genOpen[i]
+            prevBlockBrace = blockBrace
+            if ck == lexer.T_COLON && len(brStack) > 0 && brStack[len(brStack) - 1] == 2 {
+                if spacedColon[i] {
+                    prevSliceColon = 2
+                } else {
+                    prevSliceColon = 1
+                }
+            } else {
+                prevSliceColon = 0
+            }
+            if ck != lexer.T_RBRACKET {
+                prevTypeClose = false
+                // prevTypeCtx persists: the '{' following '[]T' still
+                // needs the context recorded for that '['.
+            }
+        }
+    }
+
+    lines = pushLine(lines, &out)
+    out.Free()
+    return lines
+}
+
+// pushLine appends the current line buffer (trailing space trimmed) to the
+// lines slice if it has content, and resets the buffer.
+fn pushLine(lines: []string, out: *buf.Buffer) -> []string {
+    s := out.String()
+    s = trimTrailing(s)
+    if str.Len(s) > 0 {
+        lines = append(lines, s)
+    }
+    out.Reset()
+    return lines
+}
+
+// boolSlice allocates n falses (make([]bool, n) is not portable here).
+fn boolSlice(n: int) -> []bool {
+    var b []bool
+    for i := 0; i < n; i = i + 1 {
+        b = append(b, false)
+    }
+    return b
+}
+
+// ─── Generic <> detection ────────────────────────────────────────────────
+
+// markGenerics marks '<'/'>' token positions that form generic argument
+// lists (chan<T>, Map<K, V>, f[T]) rather than comparison operators.
+// A '<' counts as a generic opener when it follows an identifier or a
+// generic-producing keyword (chan, set, tensor, map) AND a balanced '>'
+// can be found ahead without crossing ; { } ( ) or a newline.
+fn markGenerics(toks: []lexer.Token, genOpen: []bool, genClose: []bool) {
+    n := len(toks)
+    for i := 0; i < n; i = i + 1 {
+        if toks[i].kind != lexer.T_LT || i == 0 {
+            continue
+        }
+        pk := toks[i - 1].kind
+        if pk != lexer.T_IDENT && pk != lexer.T_CHAN && pk != lexer.T_SET && pk != lexer.T_TENSOR && pk != lexer.T_MAP {
+            continue
+        }
+        // Balanced scan for the matching '>'. Only tokens that can appear
+        // inside a generic type argument list are allowed; anything else
+        // (literals, operators, statements) means this '<' is a comparison.
+        depth := 1
+        j := i + 1
+        matched := false
+        for j < n {
+            k := toks[j].kind
+            if k == lexer.T_LT {
+                depth = depth + 1
+            } else if k == lexer.T_GT {
+                depth = depth - 1
+                if depth == 0 {
+                    matched = true
+                    break
+                }
+            } else if !isGenericArgToken(k) {
+                break
+            }
+            j = j + 1
+        }
+        if matched {
+            genOpen[i] = true
+            genClose[j] = true
+        }
+    }
+}
+
+// isGenericArgToken reports whether a token kind can appear inside a
+// generic argument list like <T>, <K, V>, <[]T>, or <*T>. Comparison
+// operands and operators (literals, &&, ||, ==, +, parens, ...) are not
+// allowed, which lets the scanner distinguish 'a < b' from 'Map<K, V>'.
+fn isGenericArgToken(k: int) -> bool {
+    if k == lexer.T_IDENT || isTypeToken(k) {
+        return true
+    }
+    return k == lexer.T_CHAN || k == lexer.T_SET || k == lexer.T_MAP || k == lexer.T_COMMA || k == lexer.T_DOT || k == lexer.T_LBRACKET || k == lexer.T_RBRACKET || k == lexer.T_STAR || k == lexer.T_ELLIPSIS || k == lexer.T_QUESTION
+}
+
+// ─── Spacing rules ───────────────────────────────────────────────────────
+
+// needSpace decides whether a single space is emitted between the previous
+// token and the current token on the same line. The rules implement
+// gofmt-style operator spacing:
+//   binary operators spaced (a + b, x := 1, ch <- v, a < b)
+//   unary operators tight (-x, *p, &v, <-ch, !b, x!)
+//   punctuation tight (f(x, y), a[i], T{f: v}, Map<K, V>)
+//   keywords and operands separated (if x, return y, var x T)
+fn needSpace(prevKind: int, prevPrevKind: int, ck: int, curGenOpen: bool, curGenClose: bool, prevGenClose: bool, prevGenCloseCtx: bool, prevGenOpen: bool, prevTypeClose: bool, prevTypeCtx: bool, chainCtx: bool, expectOperand: bool, prevWasUnary: bool, prevTightOp: bool, prevSliceColon: int, curSliceSpaced: bool, indexDepth: int, blockBrace: bool, prevBlockBrace: bool, curCloseBlock: bool) -> bool {
+    // Comments always get a leading space when they follow code on the
+    // same line (gofmt puts one space before '//' after any token).
+    if ck == lexer.T_COMMENT || ck == lexer.T_DOC {
+        return true
+    }
+    // '}' closing a one-line block gets a space before it ('{ stmt }',
+    // '{ f() }'), except when the block is empty ('{}') or nested ('}}').
+    if ck == lexer.T_RBRACE {
+        return curCloseBlock && prevKind != lexer.T_LBRACE && prevKind != lexer.T_RBRACE
+    }
+    // A token following a one-line block '{' gets a space ('{ stmt').
+    if prevBlockBrace {
+        return true
+    }
+    // Tokens that never take a leading space.
+    if ck == lexer.T_COMMA || ck == lexer.T_SEMICOLON || ck == lexer.T_RPAREN || ck == lexer.T_RBRACKET {
+        return false
+    }
+    if ck == lexer.T_DOT || ck == lexer.T_ELLIPSIS || ck == lexer.T_DOTDOT {
+        return false
+    }
+    if ck == lexer.T_COLON {
+        // Field colon 'x: T' is tight before; a slice colon inside an
+        // index bracket is spaced when the bounds are compound
+        // (s[lo+1 : hi-1]).
+        return curSliceSpaced
+    }
+    if curGenClose || curGenOpen {
+        return false
+    }
+    // '!' and '?' are tight as postfix (f()!, x?) but spaced as unary (!x).
+    if ck == lexer.T_BANG || ck == lexer.T_QUESTION {
+        return expectOperand
+    }
+    // Operand after a tight slice colon (a[1:2]) or a unary operator
+    // (-x, *p, &v, <-ch) binds tight.
+    if prevSliceColon == 1 || prevWasUnary {
+        return false
+    }
+    // A spaced slice colon (s[lo+1 : hi-1]) is followed by a space.
+    if prevSliceColon == 2 {
+        return true
+    }
+    // Operand after a tight index-context operator binds tight (a[i-1]).
+    if prevTightOp {
+        return false
+    }
+    // Tight after '.', '...', '..', '@'.
+    if prevKind == lexer.T_DOT || prevKind == lexer.T_ELLIPSIS || prevKind == lexer.T_DOTDOT || prevKind == lexer.T_AT {
+        return false
+    }
+    // Tight after openers: (x, [0, {a: 1}.
+    if prevKind == lexer.T_LPAREN || prevKind == lexer.T_LBRACKET || prevKind == lexer.T_LBRACE {
+        return false
+    }
+    // Operand after a generic '<' or a type-bracket ']' binds tight:
+    // chan<T>, []int, map[string]int.
+    if prevGenOpen || prevTypeClose {
+        return false
+    }
+
+    if ck == lexer.T_LPAREN {
+        // f(x), g()(x), a[0](x), T[K]( — tight after operands/openers.
+        if prevKind == lexer.T_IDENT || prevKind == lexer.T_RPAREN || prevKind == lexer.T_RBRACKET || prevKind == lexer.T_LPAREN || prevGenClose || isTypeToken(prevKind) {
+            return false
+        }
+        return true
+    }
+    if ck == lexer.T_LBRACKET {
+        // 'var x []int' — the identifier was just declared, this '[' is a
+        // type, not an index: space.
+        if prevKind == lexer.T_IDENT && prevPrevKind == lexer.T_VAR {
+            return true
+        }
+        // a[i], m[k][j], f()(x)[i], T[K][, map[string]int — tight.
+        if prevKind == lexer.T_IDENT || prevKind == lexer.T_RPAREN || prevKind == lexer.T_RBRACKET || prevKind == lexer.T_LPAREN || prevKind == lexer.T_LBRACE || prevKind == lexer.T_LBRACKET || prevGenClose {
+            return false
+        }
+        if prevKind == lexer.T_MAP || prevKind == lexer.T_SET {
+            return false
+        }
+        // x: []int, x := []T{, return []int — space after decl/operator.
+        return true
+    }
+    if ck == lexer.T_LBRACE {
+        // A '{' at control-flow depth is a block opener: space.
+        if blockBrace {
+            return true
+        }
+        // T{...} composite literals bind tight when the type expression
+        // sits in operand context; blocks (if x {, fn f() {, -> T {) are
+        // spaced. The operand context is the token governing the whole
+        // type expression: 'x := T{' tight, '-> T {' spaced.
+        if prevGenClose {
+            return !prevGenCloseCtx // Set[T]{
+        }
+        if prevKind == lexer.T_LPAREN || prevKind == lexer.T_LBRACKET || prevKind == lexer.T_LBRACE {
+            return false // ({ , [{ , {{
+        }
+        if prevKind == lexer.T_IDENT || isTypeToken(prevKind) {
+            if prevPrevKind == lexer.T_DOT {
+                // pkg.T{ / a.b.T{ — tight iff the chain root is in
+                // operand context.
+                return !chainCtx
+            }
+            if prevPrevKind == lexer.T_RBRACKET {
+                // map[K]V{ / []T{ — the ']' closed a type bracket;
+                // prevTypeCtx records whether its '[' chain sat in
+                // operand context (index ']' leaves it false).
+                return !prevTypeCtx
+            }
+            return !isOperandCtx(prevPrevKind) // x := Foo{, -> T {
+        }
+        if prevKind == lexer.T_RBRACKET {
+            // ']{' composite literal: tight only for a type bracket in
+            // operand context; 'a[i] {' is index + block.
+            return !prevTypeCtx
+        }
+        return true
+    }
+    // Inside index/slice brackets gofmt suppresses spaces around
+    // arithmetic operators (a[i-1], s[lo+1 : hi-1]) while comparisons
+    // and logic stay spaced (a[i < j], a[b && c]).
+    if indexDepth > 0 && !expectOperand && isArithOp(ck) {
+        return false
+    }
+    // All remaining binary operators take spaces (including non-generic
+    // '<' and '>' comparisons).
+    if isBinaryOp(ck) {
+        return true
+    }
+    // Keywords get a leading space (else, if, return, in, range, ...).
+    if isKeyword(ck) {
+        return true
+    }
+    // Operand-starters (identifiers, literals, builtin type names):
+    // space after ':', ',', ';', operators, keywords, and other operands.
+    return true
+}
+
+// isArithOp reports whether a token kind is an arithmetic or bitwise
+// operator — the set gofmt keeps tight inside index/slice brackets.
+fn isArithOp(k: int) -> bool {
+    if k == lexer.T_PLUS || k == lexer.T_MINUS || k == lexer.T_STAR || k == lexer.T_SLASH || k == lexer.T_PERCENT || k == lexer.T_DBLSTAR {
+        return true
+    }
+    return k == lexer.T_AMPERSAND || k == lexer.T_PIPE || k == lexer.T_CARET || k == lexer.T_LSHIFT || k == lexer.T_RSHIFT || k == lexer.T_TILDE
+}
+
+// markSliceColons marks ':' tokens inside index/slice brackets that gofmt
+// spaces on both sides: s[lo+1 : hi-1] (a bound containing a binary
+// arithmetic operator) versus s[1:2] / s[f(x):g(y)] (simple bounds, tight).
+// For each index '[' we record its matching span; a ':' at that level is
+// spaced iff an arithmetic operator appears anywhere at that level.
+fn markSliceColons(toks: []lexer.Token, genOpen: []bool, genClose: []bool, spacedColon: []bool) {
+    n := len(toks)
+
+    // Pass 1: encl[i] = token position of the innermost enclosing index
+    // '[' for token i, or -1. Index '[' positions push their own index;
+    // other brackets push -1 for '('/'{' or -2 for a type '['.
+    encl := intSlice(n, -1)
+    var idxStack []int
+    prevKind := -1
+    prevPrevKind := -1
+    prevMarkedClose := false
+    prevTypeClose := false
+    for i := 0; i < n; i = i + 1 {
+        k := toks[i].kind
+        if k == lexer.T_NEWLINE || k == lexer.T_EOF {
+            continue
+        }
+        if len(idxStack) > 0 {
+            encl[i] = idxStack[len(idxStack) - 1]
+            if encl[i] < 0 {
+                encl[i] = -1
+            }
+        }
+        if k == lexer.T_LPAREN || k == lexer.T_LBRACE {
+            idxStack = append(idxStack, -1)
+        } else if k == lexer.T_LBRACKET {
+            if isIndexBracket(prevKind, prevPrevKind, prevMarkedClose, prevTypeClose) {
+                idxStack = append(idxStack, i)
+            } else {
+                idxStack = append(idxStack, -2)
+            }
+        } else if isCloser(k) {
+            if len(idxStack) > 0 {
+                prevTypeClose = k == lexer.T_RBRACKET && idxStack[len(idxStack) - 1] == -2
+                idxStack = idxStack[:len(idxStack) - 1]
+            }
+        }
+        if k != lexer.T_COMMENT && k != lexer.T_DOC {
+            prevPrevKind = prevKind
+            prevKind = k
+            prevMarkedClose = k == lexer.T_GT && genClose[i]
+            if k != lexer.T_RBRACKET {
+                prevTypeClose = false
+            }
+        }
+    }
+
+    // Pass 2: record which index brackets contain a value-position
+    // arithmetic operator, then mark their colons as spaced — but only
+    // when both bounds are present (s[i-1:] and s[:j+1] stay tight).
+    hasArith := make(map[int]bool)
+    expectOperand := true
+    for i := 0; i < n; i = i + 1 {
+        k := toks[i].kind
+        if k == lexer.T_NEWLINE || k == lexer.T_EOF || k == lexer.T_COMMENT || k == lexer.T_DOC {
+            continue
+        }
+        if encl[i] >= 0 && !expectOperand && isArithOp(k) {
+            hasArith[encl[i]] = true
+        }
+        expectOperand = !closesOperand(k, genClose[i])
+    }
+    for i := 0; i < n; i = i + 1 {
+        if toks[i].kind != lexer.T_COLON || encl[i] < 0 || !hasArith[encl[i]] {
+            continue
+        }
+        // Both bounds present? Previous non-comment token is not '[' or
+        // ':' and the next non-comment token is not ']'.
+        left := i - 1
+        for left >= 0 && (toks[left].kind == lexer.T_NEWLINE || toks[left].kind == lexer.T_COMMENT || toks[left].kind == lexer.T_DOC) {
+            left = left - 1
+        }
+        right := i + 1
+        for right < n && (toks[right].kind == lexer.T_NEWLINE || toks[right].kind == lexer.T_COMMENT || toks[right].kind == lexer.T_DOC) {
+            right = right + 1
+        }
+        if left >= 0 && right < n && toks[left].kind != lexer.T_LBRACKET && toks[left].kind != lexer.T_COLON && toks[right].kind != lexer.T_RBRACKET {
+            spacedColon[i] = true
+        }
+    }
+}
+
+// intSlice allocates n copies of v.
+fn intSlice(n: int, v: int) -> []int {
+    var b []int
+    for i := 0; i < n; i = i + 1 {
+        b = append(b, v)
+    }
+    return b
+}
+
+// lineStartOffsets returns the byte offset of the start of each line
+// (0-based index by line number minus 1).
+fn lineStartOffsets(text: string) -> []int {
+    var starts []int
+    starts = append(starts, 0)
+    for i := 0; i < str.Len(text); i = i + 1 {
+        if text[i] == 10 {
+            starts = append(starts, i + 1)
+        }
+    }
+    return starts
+}
+
+// rawStringAt recovers the raw source text of a string literal starting at
+// 1-based (line, col). The lexer stores T_STRING literals unescaped and
+// without quotes, so the formatted output must re-slice the source —
+// otherwise escapes would be emitted as literal control characters and the
+// quotes would be lost entirely.
+fn rawStringAt(text: string, lineStarts: []int, line: int, col: int) -> string {
+    if line < 1 || line > len(lineStarts) {
+        return ""
+    }
+    start := lineStarts[line - 1] + col - 1
+    n := str.Len(text)
+    if start >= n {
+        return ""
+    }
+    q := int(text[start])
+    if q != 34 && q != 96 { // '"' or '`'
+        return ""
+    }
+    j := start + 1
+    for j < n {
+        c := int(text[j])
+        if c == 92 && q == 34 { // backslash escape (not in raw strings)
+            j = j + 2
+            continue
+        }
+        if c == q {
+            j = j + 1
+            break
+        }
+        if c == 10 && q == 34 { // unterminated dquote string
+            break
+        }
+        j = j + 1
+    }
+    return str.Substr(text, start, j - start)
+}
+
+// isUnaryCapable reports whether a token kind can act as a unary operator
+// when it appears in operand position.
+fn isUnaryCapable(k: int) -> bool {
+    return k == lexer.T_PLUS || k == lexer.T_MINUS || k == lexer.T_STAR || k == lexer.T_AMPERSAND || k == lexer.T_BANG || k == lexer.T_TILDE || k == lexer.T_CARET || k == lexer.T_SEND
+}
+
+// isBinaryOp reports whether a token kind is a (possibly compound) binary
+// operator that takes spaces on both sides in value position.
+fn isBinaryOp(k: int) -> bool {
+    if k == lexer.T_LT || k == lexer.T_GT || k == lexer.T_LE || k == lexer.T_GE || k == lexer.T_EQ || k == lexer.T_NE {
+        return true
+    }
+    if k == lexer.T_ASSIGN || k == lexer.T_COLONASS || k == lexer.T_ARROW || k == lexer.T_FATARROW || k == lexer.T_SEND {
+        return true
+    }
+    if k == lexer.T_PLUS || k == lexer.T_MINUS || k == lexer.T_STAR || k == lexer.T_SLASH || k == lexer.T_PERCENT || k == lexer.T_DBLSTAR {
+        return true
+    }
+    if k == lexer.T_AMPERSAND || k == lexer.T_PIPE || k == lexer.T_CARET || k == lexer.T_TILDE || k == lexer.T_AND || k == lexer.T_OR {
+        return true
+    }
+    if k == lexer.T_LSHIFT || k == lexer.T_RSHIFT {
+        return true
+    }
+    if k >= lexer.T_PLUSEQ && k <= lexer.T_RSHIFTEQ {
+        return true
+    }
+    return false
+}
+
+// isBlockKeyword reports whether a keyword opens a '{' block (so a '{'
+// at the same bracket depth is a block brace, not a composite literal).
+// 'case'/'default' are excluded: their bodies are ':'-delimited.
+fn isBlockKeyword(k: int) -> bool {
+    if k == lexer.T_IF || k == lexer.T_ELSE || k == lexer.T_FOR || k == lexer.T_WHILE || k == lexer.T_UNTIL || k == lexer.T_MATCH || k == lexer.T_SWITCH || k == lexer.T_SELECT {
+        return true
+    }
+    if k == lexer.T_FN || k == lexer.T_STRUCT || k == lexer.T_ENUM || k == lexer.T_RULESET || k == lexer.T_SERVICE || k == lexer.T_TEMPLATE || k == lexer.T_IMPL || k == lexer.T_EXTERN {
+        return true
+    }
+    return k == lexer.T_RULE || k == lexer.T_WHEN || k == lexer.T_UNSAFE || k == lexer.T_COMPTIME
+}
+
+// isKeyword reports whether a token kind is a Skink keyword. Builtin type
+// tokens (int8..uint64, bool, string, bytes, error, void, tensor, map, chan,
+// set) live in the same numeric range and also count as "keyword-like" for
+// spacing — 'x: int8' and 'x: map' both need a space after ':'.
+fn isKeyword(k: int) -> bool {
+    return k >= 100 && k <= 160
+}
+
+// isTypeToken reports whether a token is a builtin type keyword usable as
+// an operand (the plain names 'int', 'float' lex as T_IDENT/T_FLOAT and are
+// covered by the generic operand rules).
+fn isTypeToken(k: int) -> bool {
+    if k >= lexer.T_INT8 && k <= lexer.T_UINT64 {
+        return true
+    }
+    // T_FLOAT doubles as the float literal token and the 'float' type
+    // keyword — the lexer reuses it for both.
+    return k == lexer.T_BOOL || k == lexer.T_STRING_TYPE || k == lexer.T_BYTES_TYPE || k == lexer.T_ERROR || k == lexer.T_VOID || k == lexer.T_TENSOR || k == lexer.T_FLOAT
+}
+
+// closesOperand reports whether a token can complete an operand — after it
+// the next token is either an operator/closer or a new statement.
+fn closesOperand(k: int, isGenClose: bool) -> bool {
+    if k == lexer.T_IDENT || k == lexer.T_INT || k == lexer.T_FLOAT || k == lexer.T_STRING || k == lexer.T_BYTES || k == lexer.T_TRUE || k == lexer.T_FALSE || k == lexer.T_NIL || k == lexer.T_IOTA {
+        return true
+    }
+    if k == lexer.T_RPAREN || k == lexer.T_RBRACKET || k == lexer.T_RBRACE || k == lexer.T_BANG || k == lexer.T_QUESTION || k == lexer.T_ELLIPSIS {
+        return true
+    }
+    if isTypeToken(k) {
+        return true
+    }
+    if k == lexer.T_GT && isGenClose {
+        return true
+    }
+    return false
+}
+
+// isOperandCtx reports whether a token makes a following type expression
+// an operand (so 'T{...}' is a composite literal rather than a block).
+// In 'x := Foo{', 'return Foo{', 'f(a, Foo{', 'x: Foo{', '[]int{'
+// the token governing the type expression is one of these. Note that
+// '->' is NOT here: 'fn f() -> T {' needs a spaced block brace.
+fn isOperandCtx(k: int) -> bool {
+    if k == lexer.T_ASSIGN || k == lexer.T_COLONASS || k == lexer.T_LPAREN || k == lexer.T_LBRACKET || k == lexer.T_LBRACE || k == lexer.T_RBRACKET || k == lexer.T_COMMA || k == lexer.T_COLON {
+        return true
+    }
+    if k == lexer.T_RETURN || k == lexer.T_DEFER || k == lexer.T_SPAWN || k == lexer.T_ASYNC || k == lexer.T_FATARROW || k == lexer.T_CASE {
+        return true
+    }
+    // '->' is a binary op for spacing but marks a return type, so the
+    // following '{' is a function-body block, not a composite literal.
+    return k != lexer.T_ARROW && isBinaryOp(k)
+}
+
+// opensBlock reports whether a token opens a bracket block — used to
+// suppress a blank line immediately after an opening bracket.
+fn opensBlock(k: int) -> bool {
+    return k == lexer.T_LBRACE || k == lexer.T_LPAREN || k == lexer.T_LBRACKET
+}
+
+// isCloser reports whether a token closes a bracket — used to dedent lines
+// starting with a closer and to suppress a blank line before one.
+fn isCloser(k: int) -> bool {
+    return k == lexer.T_RBRACE || k == lexer.T_RPAREN || k == lexer.T_RBRACKET
+}
+
+// isIndexBracket decides whether the '[' about to be emitted opens an
+// index/slice expression (a[i], a[lo:hi]) rather than a type bracket
+// ([]T, map[K]V, [4]int, [][]T). Index brackets follow an operand —
+// including an index ']' (a[i][j]) but NOT a type ']' ([][]T).
+fn isIndexBracket(prevKind: int, prevPrevKind: int, prevGenClose: bool, prevTypeClose: bool) -> bool {
+    if prevKind == lexer.T_IDENT && prevPrevKind == lexer.T_VAR {
+        return false // var x []int — type bracket
+    }
+    if prevKind == lexer.T_RBRACKET {
+        return !prevTypeClose // a[i][j] index; [][]T type
+    }
+    if prevKind == lexer.T_IDENT || prevKind == lexer.T_RPAREN || prevGenClose {
+        return true
+    }
+    return false
+}
+
+// countLeadingClosers counts consecutive closing brackets on the same
+// source line starting at token index i (for line-start dedent).
+fn countLeadingClosers(toks: []lexer.Token, i: int) -> int {
+    count := 0
+    line := toks[i].line
+    for i < len(toks) && toks[i].line == line && isCloser(toks[i].kind) {
+        count = count + 1
+        i = i + 1
+    }
+    return count
+}
+
+// countNewlines counts '\n' bytes in s — used so multi-line token literals
+// (block comments, backtick strings) advance the covered-line tracker.
+fn countNewlines(s: string) -> int {
+    c := 0
+    for i := 0; i < str.Len(s); i = i + 1 {
+        if s[i] == 10 {
+            c = c + 1
+        }
+    }
+    return c
+}
+
+// ─── Field-column alignment (gofmt tabwriter parity) ─────────────────────
+
+// alignFieldColumns aligns runs of "name: value" lines — struct fields,
+// composite-literal entries, map entries, parameter lines — so their value
+// columns and trailing comments line up, like gofmt's tabwriter.
+// Inside paren blocks (const (...), var (...), import (...)), runs of
+// "name = value" lines get their '=' columns aligned instead.
+// A run is ≥2 consecutive matching lines at the same indent.
+fn alignFieldColumns(lines: []string) -> []string {
+    // Track paren-block membership for '=' alignment: a line ending with
+    // '(' opens a block; a line starting with ')' closes it.
+    inParen := boolSlice(len(lines))
+    pdepth := 0
+    for i := 0; i < len(lines); i = i + 1 {
+        t := str.Trim(lines[i])
+        if str.StartsWith(t, ")") {
+            pdepth = pdepth - 1
+            if pdepth < 0 {
+                pdepth = 0
+            }
+        }
+        inParen[i] = pdepth > 0
+        if str.EndsWith(t, "(") {
+            pdepth = pdepth + 1
+        }
+    }
+
+    aligned := boolSlice(len(lines)) // lines already fixed by a pass
+
+    i := 0
+    for i < len(lines) {
+        ok, indentW, _, _, _, _ := parseFieldLine(lines[i])
+        if !ok {
+            i = i + 1
+            continue
+        }
+        // Collect the run of consecutive field lines at the same indent.
+        runStart := i
+        var indents []int
+        var nameWs []int
+        var valStarts []int
+        var valEnds []int
+        var comStarts []int
+        for i < len(lines) {
+            ok2, ind2, nw2, vs2, ve2, cs2 := parseFieldLine(lines[i])
+            if !ok2 || ind2 != indentW {
+                break
+            }
+            indents = append(indents, ind2)
+            nameWs = append(nameWs, nw2)
+            valStarts = append(valStarts, vs2)
+            valEnds = append(valEnds, ve2)
+            comStarts = append(comStarts, cs2)
+            i = i + 1
+        }
+        if len(indents) < 2 {
+            continue
+        }
+        // Column widths: value column starts after the widest 'name:'.
+        maxName := 0
+        maxVal := 0
+        for j := 0; j < len(indents); j = j + 1 {
+            if nameWs[j] > maxName {
+                maxName = nameWs[j]
+            }
+            if valEnds[j] - valStarts[j] > maxVal {
+                maxVal = valEnds[j] - valStarts[j]
+            }
+        }
+        // Rebuild each line with padded columns.
+        for j := 0; j < len(indents); j = j + 1 {
+            s := lines[runStart + j]
+            line := str.Substr(s, 0, valStarts[j])
+            // Pad name:colon region so values line up.
+            pad := maxName - nameWs[j]
+            for p := 0; p < pad; p = p + 1 {
+                line = str.Concat(line, " ")
+            }
+            line = str.Concat(line, str.Substr(s, valStarts[j], valEnds[j] - valStarts[j]))
+            if comStarts[j] >= 0 {
+                // Align trailing comments at one column past the widest value.
+                pad = maxVal - (valEnds[j] - valStarts[j]) + 1
+                for p := 0; p < pad; p = p + 1 {
+                    line = str.Concat(line, " ")
+                }
+                line = str.Concat(line, str.Substr(s, comStarts[j], str.Len(s) - comStarts[j]))
+            }
+            lines[runStart + j] = line
+            aligned[runStart + j] = true
+        }
+    }
+    return alignAssignColumns(lines, inParen, aligned)
+}
+
+// alignAssignColumns aligns the '=' column of consecutive "name = value"
+// lines inside paren blocks (const (...), var (...)), like gofmt's
+// tabwriter. Plain statement assignments are untouched. Lines realigned
+// here are marked in `aligned`.
+fn alignAssignColumns(lines: []string, inParen: []bool, aligned: []bool) -> []string {
+    i := 0
+    for i < len(lines) {
+        if !inParen[i] {
+            i = i + 1
+            continue
+        }
+        ok, indentW, _, _, _, _, _ := parseAssignLine(lines[i])
+        if !ok {
+            i = i + 1
+            continue
+        }
+        runStart := i
+        var nameWs []int
+        var valStarts []int
+        var valEnds []int
+        var comStarts []int
+        for i < len(lines) && inParen[i] {
+            ok2, ind2, nw2, vs2, ve2, cs2, _ := parseAssignLine(lines[i])
+            if !ok2 || ind2 != indentW {
+                break
+            }
+            nameWs = append(nameWs, nw2)
+            valStarts = append(valStarts, vs2)
+            valEnds = append(valEnds, ve2)
+            comStarts = append(comStarts, cs2)
+            i = i + 1
+        }
+        if len(nameWs) < 2 {
+            continue
+        }
+        maxName := 0
+        maxVal := 0
+        for j := 0; j < len(nameWs); j = j + 1 {
+            if nameWs[j] > maxName {
+                maxName = nameWs[j]
+            }
+            if valEnds[j] - valStarts[j] > maxVal {
+                maxVal = valEnds[j] - valStarts[j]
+            }
+        }
+        for j := 0; j < len(nameWs); j = j + 1 {
+            s := lines[runStart + j]
+            // name + pad + "= " + value
+            line := str.Substr(s, 0, indentW + nameWs[j])
+            pad := maxName - nameWs[j]
+            for p := 0; p < pad; p = p + 1 {
+                line = str.Concat(line, " ")
+            }
+            line = str.Concat(line, " = ")
+            line = str.Concat(line, str.Substr(s, valStarts[j], valEnds[j] - valStarts[j]))
+            if comStarts[j] >= 0 {
+                pad = maxVal - (valEnds[j] - valStarts[j]) + 1
+                for p := 0; p < pad; p = p + 1 {
+                    line = str.Concat(line, " ")
+                }
+                line = str.Concat(line, str.Substr(s, comStarts[j], str.Len(s) - comStarts[j]))
+            }
+            lines[runStart + j] = line
+            aligned[runStart + j] = true
+        }
+    }
+    return alignComments(lines, aligned)
+}
+
+// alignComments aligns trailing '//' comments in runs of consecutive
+// commented code lines, like gofmt's tabwriter. A run breaks on a blank
+// line, an uncommented line, or a whole-line comment.
+fn alignComments(lines: []string, aligned: []bool) -> []string {
+    i := 0
+    for i < len(lines) {
+        c := trailingComment(lines[i])
+        if aligned[i] || c < 0 {
+            i = i + 1
+            continue
+        }
+        runStart := i
+        var comPos []int
+        for i < len(lines) && !aligned[i] {
+            c2 := trailingComment(lines[i])
+            if c2 < 0 {
+                break
+            }
+            comPos = append(comPos, c2)
+            i = i + 1
+        }
+        if len(comPos) < 2 {
+            continue
+        }
+        // Target column: one space past the widest content end.
+        maxEnd := 0
+        for j := 0; j < len(comPos); j = j + 1 {
+            s := lines[runStart + j]
+            contentEnd := comPos[j] - 1
+            for contentEnd > 0 && s[contentEnd - 1] == 32 {
+                contentEnd = contentEnd - 1
+            }
+            if contentEnd > maxEnd {
+                maxEnd = contentEnd
+            }
+        }
+        for j := 0; j < len(comPos); j = j + 1 {
+            s := lines[runStart + j]
+            contentEnd := comPos[j] - 1
+            for contentEnd > 0 && s[contentEnd - 1] == 32 {
+                contentEnd = contentEnd - 1
+            }
+            pad := maxEnd - contentEnd + 1
+            line := str.Substr(s, 0, contentEnd)
+            for p := 0; p < pad; p = p + 1 {
+                line = str.Concat(line, " ")
+            }
+            line = str.Concat(line, str.Substr(s, comPos[j], str.Len(s) - comPos[j]))
+            lines[runStart + j] = line
+        }
+    }
+    return lines
+}
+
+// trailingComment returns the byte index of a trailing '//' comment's
+// first '/', or -1. A comment counts only when real code precedes it on
+// the line (whole-line comments are not aligned). '//' inside string
+// literals is ignored.
+fn trailingComment(s: string) -> int {
+    n := str.Len(s)
+    inStr := 0 // 0 none, 1 dquote, 2 backtick
+    k := 0
+    sawCode := false
+    for k < n {
+        ch := s[k]
+        if inStr == 1 {
+            if ch == 92 {
+                k = k + 2
+                continue
+            }
+            if ch == 34 {
+                inStr = 0
+            }
+        } else if inStr == 2 {
+            if ch == 96 {
+                inStr = 0
+            }
+        } else {
+            if ch == 34 {
+                inStr = 1
+                sawCode = true
+            } else if ch == 96 {
+                inStr = 2
+                sawCode = true
+            } else if ch == 47 && k + 1 < n && s[k + 1] == 47 {
+                if !sawCode {
+                    return -1
+                }
+                return k
+            } else if ch != 32 && ch != 9 {
+                sawCode = true
+            }
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// parseFieldLine parses a formatted line as a "name: value // comment" field
+// entry. Returns (ok, indentWidth, nameWidth, valueStart, valueEnd,
+// commentStart) — commentStart is -1 when no trailing comment exists.
+// Lines that don't fit the shape (assignments with :=, case labels, call
+// expressions, strings containing ':' inside quotes) are rejected.
+fn parseFieldLine(s: string) -> (bool, int, int, int, int, int) {
+    n := str.Len(s)
+    j := 0
+    for j < n && (s[j] == 32 || s[j] == 9) {
+        j = j + 1
+    }
+    indentW := j
+    if j >= n {
+        return false, 0, 0, 0, 0, -1
+    }
+
+    // Name: identifier, quoted string key, or number key.
+    c := s[j]
+    nameStart := j
+    if c == 34 || c == 96 { // '"' or '`'
+        q := c
+        j = j + 1
+        for j < n && s[j] != q {
+            if s[j] == 92 { // backslash escape
+                j = j + 1
+            }
+            j = j + 1
+        }
+        if j >= n {
+            return false, 0, 0, 0, 0, -1
+        }
+        j = j + 1 // past closing quote
+    } else if isIdentStartB(c) {
+        for j < n && isIdentCharB(s[j]) {
+            j = j + 1
+        }
+    } else if c >= 48 && c <= 57 {
+        for j < n && s[j] >= 48 && s[j] <= 57 {
+            j = j + 1
+        }
+    } else {
+        return false, 0, 0, 0, 0, -1
+    }
+    nameW := j - nameStart
+
+    // Optional spaces, then ':' (but not ':=' or '::').
+    for j < n && s[j] == 32 {
+        j = j + 1
+    }
+    if j >= n || s[j] != 58 { // ':'
+        return false, 0, 0, 0, 0, -1
+    }
+    if j + 1 < n && (s[j + 1] == 61 || s[j + 1] == 58) { // '=' or ':'
+        return false, 0, 0, 0, 0, -1
+    }
+    j = j + 1
+
+    // Value start.
+    for j < n && s[j] == 32 {
+        j = j + 1
+    }
+    if j >= n {
+        return false, 0, 0, 0, 0, -1 // 'name:' alone — not an alignable field
+    }
+    valStart := j
+
+    // Value end and optional trailing comment (" //" outside strings).
+    valEnd := n
+    comStart := -1
+    inStr := 0 // 0 none, 1 dquote, 2 backtick
+    k := j
+    for k < n {
+        ch := s[k]
+        if inStr == 1 {
+            if ch == 92 {
+                k = k + 2
+                continue
+            }
+            if ch == 34 {
+                inStr = 0
+            }
+        } else if inStr == 2 {
+            if ch == 96 {
+                inStr = 0
+            }
+        } else {
+            if ch == 34 {
+                inStr = 1
+            } else if ch == 96 {
+                inStr = 2
+            } else if ch == 32 && k + 1 < n && s[k + 1] == 47 && k + 2 < n && s[k + 2] == 47 {
+                comStart = k + 1
+                valEnd = k
+                break
+            }
+        }
+        k = k + 1
+    }
+    return true, indentW, nameW, valStart, valEnd, comStart
+}
+
+// parseAssignLine parses a formatted line as a "name = value // comment"
+// assignment inside a declaration block. Returns (ok, indentWidth,
+// nameWidth, valueStart, valueEnd, commentStart, eqPos) — commentStart is
+// -1 when no trailing comment exists. Rejects '==' comparisons, compound
+// assignments (+=), and 'name =' with no value.
+fn parseAssignLine(s: string) -> (bool, int, int, int, int, int, int) {
+    n := str.Len(s)
+    j := 0
+    for j < n && (s[j] == 32 || s[j] == 9) {
+        j = j + 1
+    }
+    indentW := j
+    if j >= n || !isIdentStartB(s[j]) {
+        return false, 0, 0, 0, 0, -1, 0
+    }
+    nameStart := j
+    for j < n && isIdentCharB(s[j]) {
+        j = j + 1
+    }
+    nameW := j - nameStart
+
+    // Optional spaces, then '=' (not '==').
+    for j < n && s[j] == 32 {
+        j = j + 1
+    }
+    if j >= n || s[j] != 61 { // '='
+        return false, 0, 0, 0, 0, -1, 0
+    }
+    if j + 1 < n && s[j + 1] == 61 { // '=='
+        return false, 0, 0, 0, 0, -1, 0
+    }
+    eqPos := j
+    j = j + 1
+    for j < n && s[j] == 32 {
+        j = j + 1
+    }
+    if j >= n {
+        return false, 0, 0, 0, 0, -1, 0
+    }
+    valStart := j
+
+    valEnd := n
+    comStart := -1
+    inStr := 0
+    k := j
+    for k < n {
+        ch := s[k]
+        if inStr == 1 {
+            if ch == 92 {
+                k = k + 2
+                continue
+            }
+            if ch == 34 {
+                inStr = 0
+            }
+        } else if inStr == 2 {
+            if ch == 96 {
+                inStr = 0
+            }
+        } else {
+            if ch == 34 {
+                inStr = 1
+            } else if ch == 96 {
+                inStr = 2
+            } else if ch == 32 && k + 1 < n && s[k + 1] == 47 && k + 2 < n && s[k + 2] == 47 {
+                comStart = k + 1
+                valEnd = k
+                break
+            }
+        }
+        k = k + 1
+    }
+    return true, indentW, nameW, valStart, valEnd, comStart, eqPos
+}
+
+// isIdentStartB reports whether byte c can start an identifier.
+fn isIdentStartB(c: int) -> bool {
+    if c >= 97 && c <= 122 { return true }
+    if c >= 65 && c <= 90 { return true }
+    return c == 95
+}
+
+// isIdentCharB reports whether byte c can continue an identifier.
+fn isIdentCharB(c: int) -> bool {
+    if isIdentStartB(c) {
+        return true
+    }
+    return c >= 48 && c <= 57
+}
+
+// ─── Indent helpers ──────────────────────────────────────────────────────
+
+// makeIndent creates an indentation string of n levels.
+// If insertSpaces is true, uses indentSize spaces per level; otherwise
+// uses one tab per level.
+fn makeIndent(n: int, indentSize: int, insertSpaces: bool) -> string {
+    if n <= 0 {
+        return ""
+    }
+    if insertSpaces {
+        unit := ""
+        for j := 0; j < indentSize; j = j + 1 {
+            unit = str.Concat(unit, " ")
+        }
+        result := ""
+        for i := 0; i < n; i = i + 1 {
+            result = str.Concat(result, unit)
+        }
+        return result
+    }
+    // Tabs
+    result := ""
+    for i := 0; i < n; i = i + 1 {
+        result = str.Concat(result, "\t")
+    }
+    return result
+}
+
+// trimTrailing removes trailing whitespace from a string.
+fn trimTrailing(s: string) -> string {
+    n := str.Len(s)
+    if n == 0 {
+        return s
+    }
+    end := n
+    for end > 0 {
+        c := int(s[end - 1])
+        if c == 32 || c == 9 {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    if end == n {
+        return s
+    }
+    return str.Substr(s, 0, end)
+}

@@ -1,0 +1,168 @@
+// skinkfmt formats Skink source code to the canonical, gofmt-inspired
+// style implemented by lsp/formatting (the same engine that powers the
+// LSP server's formatting providers).
+//
+// Usage:
+//   skinkfmt [flags] [file ...]
+//
+// With no file arguments, or when the file is "-", input is read from
+// standard input and the formatted output is written to standard output.
+//
+// Flags:
+//   -w           write result to (source) file instead of stdout
+//   -l           list files whose formatting differs from skinkfmt's
+//   -tabs        indent with tabs instead of spaces
+//   -tabwidth N  spaces per indentation level (default 4)
+module main
+
+import "std/os"
+import "std/str"
+import "std/strconv"
+import "std/fs"
+import "std/io"
+import "std/libc"
+import "lsp/formatting"
+
+extern fn read(fd: int, buf: string, count: int) -> int
+extern fn write(fd: int, buf: string, count: int) -> int
+
+// readAllStdin reads stdin until EOF and returns the full contents.
+fn readAllStdin() -> string {
+    chunk := libc.malloc(8192)
+    total := 0
+    cap := 8192
+    result := libc.malloc(cap)
+    for {
+        n := read(0, chunk, 8192)
+        if n <= 0 {
+            break
+        }
+        if total + n + 1 > cap {
+            newCap := cap * 2
+            if newCap < total + n + 1 {
+                newCap = total + n + 1
+            }
+            result = libc.realloc(result, newCap)
+            cap = newCap
+        }
+        dest := string(int64(result) + int64(total))
+        libc.memcpy(dest, chunk, n)
+        total = total + n
+    }
+    libc.free(chunk)
+    result[total] = 0
+    return result
+}
+
+// printErr writes a line to stderr and returns for convenient tail-calls.
+fn printErr(msg: string) {
+    write(2, str.Concat(msg, "\n"), str.Len(msg) + 1)
+}
+
+// usage prints command-line help to stderr.
+fn usage() {
+    printErr("usage: skinkfmt [flags] [file ...]")
+    printErr("  -w           write result to (source) file instead of stdout")
+    printErr("  -l           list files whose formatting differs from skinkfmt's")
+    printErr("  -tabs        indent with tabs instead of spaces")
+    printErr("  -tabwidth N  spaces per indentation level (default 4)")
+    printErr("With no file arguments, or when the file is \"-\", reads stdin.")
+}
+
+// formatOne formats the contents of `source` (a display name for errors)
+// and reports the result according to the flags. Returns 0 on success,
+// 2 on a processing error (gofmt's convention).
+fn formatOne(name: string, src: string, doWrite: bool, doList: bool, tabwidth: int, tabs: bool) -> int {
+    formatted := formatting.Format(src, tabwidth, !tabs)
+    changed := !str.Equal(src, formatted)
+    if doList {
+        // -l lists only files whose formatting differs.
+        if changed {
+            io.PrintLine(name)
+        }
+        return 0
+    }
+    if doWrite && !str.Equal(name, "stdin") {
+        if !changed {
+            return 0
+        }
+        err := fs.WriteAll(name, formatted)
+        if err.message != "" {
+            printErr(str.Concat("skinkfmt: ", str.Concat(name, str.Concat(": ", err.message))))
+            return 2
+        }
+        return 0
+    }
+    io.PrintString(formatted)
+    return 0
+}
+
+// main is the skinkfmt entry point: parse flags, then format each file or
+// stdin. Exit status: 0 success, 1 usage error, 2 processing error.
+fn main() -> int {
+    args := os.Args()
+
+    doWrite := false
+    doList := false
+    tabs := false
+    tabwidth := 4
+    var files []string
+
+    i := 1
+    for i < len(args) {
+        arg := args[i]
+        if str.Equal(arg, "-w") {
+            doWrite = true
+        } else if str.Equal(arg, "-l") {
+            doList = true
+        } else if str.Equal(arg, "-tabs") {
+            tabs = true
+        } else if str.Equal(arg, "-tabwidth") {
+            i = i + 1
+            if i >= len(args) {
+                printErr("skinkfmt: -tabwidth requires a value")
+                usage()
+                return 1
+            }
+            var ok bool
+            tabwidth, ok = strconv.ParseInt(args[i])
+            if !ok || tabwidth < 1 {
+                printErr("skinkfmt: invalid -tabwidth value")
+                return 1
+            }
+        } else if str.Equal(arg, "-h") || str.Equal(arg, "--help") {
+            usage()
+            return 0
+        } else if str.Len(arg) > 1 && arg[0] == 45 && !str.Equal(arg, "-") {
+            printErr(str.Concat("skinkfmt: unknown flag ", arg))
+            usage()
+            return 1
+        } else {
+            files = append(files, arg)
+        }
+        i = i + 1
+    }
+
+    // stdin mode: no files, or explicit "-".
+    if len(files) == 0 || (len(files) == 1 && str.Equal(files[0], "-")) {
+        src := readAllStdin()
+        rc := formatOne("stdin", src, doWrite, doList, tabwidth, tabs)
+        return rc
+    }
+
+    exitCode := 0
+    for i = 0; i < len(files); i = i + 1 {
+        path := files[i]
+        src, rerr := fs.ReadAll(path)
+        if rerr.message != "" {
+            printErr(str.Concat("skinkfmt: ", str.Concat(path, str.Concat(": ", rerr.message))))
+            exitCode = 2
+            continue
+        }
+        rc := formatOne(path, src, doWrite, doList, tabwidth, tabs)
+        if rc != 0 {
+            exitCode = rc
+        }
+    }
+    return exitCode
+}

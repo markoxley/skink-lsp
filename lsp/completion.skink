@@ -1,0 +1,835 @@
+// Module completion provides code completion for the LSP server.
+//
+// It offers keyword completions, identifier completions from the document,
+// snippet completions for common Skink constructs, and member completions
+// after '.' — imported module declarations, struct fields/methods, and
+// enum variants.
+module completion
+
+import "std/json"
+import "std/str"
+import "std/lexer"
+import "std/parser"
+import "std/ast"
+import "lsp/documents"
+import "lsp/utils"
+
+// Snippet definitions: label, insertText, description
+struct Snippet {
+    label: string
+    insertText: string
+    detail: string
+}
+
+// buildKeywords returns the list of Skink keywords.
+fn buildKeywords() -> []string {
+    var kws []string
+    kws = append(kws, "fn")
+    kws = append(kws, "pub")
+    kws = append(kws, "const")
+    kws = append(kws, "var")
+    kws = append(kws, "type")
+    kws = append(kws, "struct")
+    kws = append(kws, "enum")
+    kws = append(kws, "if")
+    kws = append(kws, "else")
+    kws = append(kws, "match")
+    kws = append(kws, "for")
+    kws = append(kws, "while")
+    kws = append(kws, "until")
+    kws = append(kws, "in")
+    kws = append(kws, "range")
+    kws = append(kws, "break")
+    kws = append(kws, "continue")
+    kws = append(kws, "return")
+    kws = append(kws, "defer")
+    kws = append(kws, "import")
+    kws = append(kws, "module")
+    kws = append(kws, "extern")
+    kws = append(kws, "true")
+    kws = append(kws, "false")
+    kws = append(kws, str.Concat("ni", "l"))
+    kws = append(kws, "spawn")
+    kws = append(kws, "async")
+    kws = append(kws, "await")
+    kws = append(kws, "select")
+    kws = append(kws, "switch")
+    kws = append(kws, "case")
+    kws = append(kws, "default")
+    kws = append(kws, "map")
+    kws = append(kws, "chan")
+    kws = append(kws, "set")
+    kws = append(kws, "void")
+    kws = append(kws, "error")
+    kws = append(kws, "unsafe")
+    kws = append(kws, "with")
+    kws = append(kws, "as")
+    kws = append(kws, "from")
+    kws = append(kws, "where")
+    kws = append(kws, "into")
+    kws = append(kws, "comptime")
+    kws = append(kws, "impl")
+    kws = append(kws, "template")
+    kws = append(kws, "service")
+    kws = append(kws, "ruleset")
+    kws = append(kws, "rule")
+    kws = append(kws, "when")
+    kws = append(kws, "action")
+    kws = append(kws, "priority")
+    kws = append(kws, "tensor")
+    kws = append(kws, "iota")
+    kws = append(kws, "sizeof")
+    kws = append(kws, "alignof")
+    kws = append(kws, "byte")
+    kws = append(kws, "by")
+    kws = append(kws, "group")
+    kws = append(kws, "join")
+    kws = append(kws, "orderby")
+    kws = append(kws, "ascending")
+    kws = append(kws, "descending")
+    return kws
+}
+
+// buildSnippets returns the list of code snippets.
+fn buildSnippets() -> []Snippet {
+    var snips []Snippet
+    snips = append(snips, Snippet{label: "fn", insertText: "fn ${1:name}(${2:args}) -> ${3:ret} {\n    ${4}\n}", detail: "Function declaration"})
+    snips = append(snips, Snippet{label: "pub fn", insertText: "pub fn ${1:name}(${2:args}) -> ${3:ret} {\n    ${4}\n}", detail: "Public function declaration"})
+    snips = append(snips, Snippet{label: "struct", insertText: "struct ${1:Name} {\n    ${2:field}: ${3:type}\n}", detail: "Struct declaration"})
+    snips = append(snips, Snippet{label: "pub struct", insertText: "pub struct ${1:Name} {\n    ${2:field}: ${3:type}\n}", detail: "Public struct declaration"})
+    snips = append(snips, Snippet{label: "enum", insertText: "enum ${1:Name} {\n    ${2:Variant}\n}", detail: "Enum/tagged union declaration"})
+    snips = append(snips, Snippet{label: "if", insertText: "if ${1:condition} {\n    ${2}\n}", detail: "If statement"})
+    snips = append(snips, Snippet{label: "if else", insertText: "if ${1:condition} {\n    ${2}\n} else {\n    ${3}\n}", detail: "If-else statement"})
+    snips = append(snips, Snippet{label: "for", insertText: "for ${1:i} := 0; ${1:i} < ${2:n}; ${1:i} = ${1:i} + 1 {\n    ${3}\n}", detail: "For loop"})
+    snips = append(snips, Snippet{label: "for in", insertText: "for ${1:item} := range ${2:collection} {\n    ${3}\n}", detail: "For-in range loop"})
+    snips = append(snips, Snippet{label: "while", insertText: "while ${1:condition} {\n    ${2}\n}", detail: "While loop"})
+    snips = append(snips, Snippet{label: "match", insertText: "match ${1:subject} {\n    ${2:pattern} => ${3:body}\n    _ => ${4:default}\n}", detail: "Match expression"})
+    snips = append(snips, Snippet{label: "switch", insertText: "switch ${1:subject} {\n    case ${2:value}:\n        ${3}\n    default:\n        ${4}\n}", detail: "Switch statement"})
+    snips = append(snips, Snippet{label: "import", insertText: "import \"${1:std/module}\"", detail: "Import statement"})
+    snips = append(snips, Snippet{label: "module", insertText: "module ${1:name}", detail: "Module declaration"})
+    snips = append(snips, Snippet{label: "const", insertText: "const ${1:NAME} = ${2:value}", detail: "Constant declaration"})
+    snips = append(snips, Snippet{label: "type", insertText: "type ${1:Name} = ${2:underlying}", detail: "Type alias"})
+    snips = append(snips, Snippet{label: "defer", insertText: "defer ${1:funcall()}", detail: "Deferred function call"})
+    snips = append(snips, Snippet{label: "spawn", insertText: "spawn ${1:func()}", detail: "Spawn goroutine"})
+    snips = append(snips, Snippet{label: "select", insertText: "select {\n    case ${1:msg} := <-${2:chan}:\n        ${3}\n}", detail: "Select statement"})
+    snips = append(snips, Snippet{label: "template", insertText: "template ${1:Name} {\n    fn ${2:method}(self: ${1:Name}) -> ${3:ret}\n}", detail: "Template (interface) declaration"})
+    snips = append(snips, Snippet{label: "service", insertText: "service ${1:Name} {\n    fn ${2:method}(${3:args}) -> ${4:ret}\n}", detail: "Service declaration"})
+    snips = append(snips, Snippet{label: "ruleset", insertText: "ruleset ${1:Name} {\n    rule ${2:name} when ${3:condition} {\n        action: {\n            ${4}\n        }\n        priority: ${5:0}\n    }\n}", detail: "Ruleset declaration"})
+    snips = append(snips, Snippet{label: "await", insertText: "await ${1:future}", detail: "Await a future"})
+    snips = append(snips, Snippet{label: "until", insertText: "until ${1:condition} {\n    ${2}\n}", detail: "Until loop"})
+    return snips
+}
+
+// buildBuiltinTypes returns the list of built-in type names.
+fn buildBuiltinTypes() -> []string {
+    var types []string
+    types = append(types, "int")
+    types = append(types, "int8")
+    types = append(types, "int16")
+    types = append(types, "int32")
+    types = append(types, "int64")
+    types = append(types, "uint")
+    types = append(types, "uint8")
+    types = append(types, "uint16")
+    types = append(types, "uint32")
+    types = append(types, "uint64")
+    types = append(types, "float")
+    types = append(types, "bool")
+    types = append(types, "string")
+    types = append(types, "bytes")
+    types = append(types, "void")
+    return types
+}
+
+// buildBuiltins returns the list of built-in function names.
+fn buildBuiltins() -> []string {
+    var fns []string
+    fns = append(fns, "print")
+    fns = append(fns, "println")
+    fns = append(fns, "len")
+    fns = append(fns, "append")
+    fns = append(fns, "make")
+    fns = append(fns, "close")
+    fns = append(fns, "copy")
+    fns = append(fns, "delete")
+    fns = append(fns, "panic")
+    fns = append(fns, "recover")
+    fns = append(fns, "assert")
+    fns = append(fns, "sin")
+    fns = append(fns, "cos")
+    fns = append(fns, "tan")
+    fns = append(fns, "sqrt")
+    fns = append(fns, "pow")
+    fns = append(fns, "dot")
+    fns = append(fns, "norm")
+    return fns
+}
+
+// provide returns completion items for the given position.
+pub fn provide(dm: *documents.DocumentManager, params: json.Value, skinkHome: string) -> json.Value {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+    pos := json.ObjectGet(params, "position")
+    line := int(json.AsNumber(json.ObjectGet(pos, "line")))
+    character := int(json.AsNumber(json.ObjectGet(pos, "character")))
+
+    text, ok := documents.getText(dm, uri)
+    if !ok {
+        return json.Null()
+    }
+
+    // word is the identifier fragment being typed; before is the line text
+    // in front of it. Completion filters on `word`, never on the whole line
+    // prefix — filtering on e.g. "x := str.Con" matched nothing and broke
+    // autocomplete everywhere except at the start of a line.
+    word, before := utils.wordBeforeAt(text, line, character)
+
+    // Member completion: the text before the word ends with '<receiver>.'
+    trimmedBefore := str.Trim(before)
+    if str.EndsWith(trimmedBefore, ".") {
+        recvText := str.Substr(trimmedBefore, 0, str.Len(trimmedBefore) - 1)
+        receiver := utils.trailingIdent(recvText)
+        items := memberItems(text, documents.uriToPath(uri), receiver, word, skinkHome, line)
+        return json.FromObject([]string{"isIncomplete", "items"}, []json.Value{json.FromBool(false), json.FromArray(items)})
+    }
+
+    var items []json.Value
+    // seen tracks labels already added to items to avoid O(n²) dedup scans.
+    // Map key lookup is O(1) average, making the overall completion build O(n).
+    seen := make(map[string]bool)
+
+    // 1. Add keyword completions
+    kws := buildKeywords()
+    for i := 0; i < len(kws); i = i + 1 {
+        kw := kws[i]
+        if str.Len(word) == 0 || str.StartsWith(kw, word) {
+            if !seen[kw] {
+                seen[kw] = true
+                item := json.FromObject([]string{"label", "kind", "detail"}, []json.Value{json.FromString(kw), json.FromNumber(float(14)), json.FromString("keyword")})
+                items = append(items, item)
+            }
+        }
+    }
+
+    // 2. Add snippet completions
+    snips := buildSnippets()
+    for i := 0; i < len(snips); i = i + 1 {
+        snip := snips[i]
+        if str.Len(word) == 0 || str.StartsWith(snip.label, word) {
+            if !seen[snip.label] {
+                seen[snip.label] = true
+                item := json.FromObject([]string{"label", "kind", "detail", "insertText", "insertTextFormat"}, []json.Value{json.FromString(snip.label), json.FromNumber(float(15)), json.FromString(snip.detail), json.FromString(snip.insertText), json.FromNumber(float(2))})
+                items = append(items, item)
+            }
+        }
+    }
+
+    // 3. Add identifier completions from the document
+    idents := extractIdentifiers(text)
+    for i := 0; i < len(idents); i = i + 1 {
+        ident := idents[i]
+        if str.Len(word) == 0 || str.StartsWith(ident, word) {
+            if !seen[ident] {
+                seen[ident] = true
+                item := json.FromObject([]string{"label", "kind", "detail"}, []json.Value{json.FromString(ident), json.FromNumber(float(6)), json.FromString("identifier")})
+                items = append(items, item)
+            }
+        }
+    }
+
+    // 4. Add built-in type completions
+    builtinTypes := buildBuiltinTypes()
+    for i := 0; i < len(builtinTypes); i = i + 1 {
+        bt := builtinTypes[i]
+        if str.Len(word) == 0 || str.StartsWith(bt, word) {
+            if !seen[bt] {
+                seen[bt] = true
+                item := json.FromObject([]string{"label", "kind", "detail"}, []json.Value{json.FromString(bt), json.FromNumber(float(21)), json.FromString("built-in type")})
+                items = append(items, item)
+            }
+        }
+    }
+
+    // 5. Add built-in function completions
+    builtins := buildBuiltins()
+    for i := 0; i < len(builtins); i = i + 1 {
+        bf := builtins[i]
+        if str.Len(word) == 0 || str.StartsWith(bf, word) {
+            if !seen[bf] {
+                seen[bf] = true
+                item := json.FromObject([]string{"label", "kind", "detail"}, []json.Value{json.FromString(bf), json.FromNumber(float(3)), json.FromString("built-in function")})
+                items = append(items, item)
+            }
+        }
+    }
+
+    return json.FromObject([]string{"isIncomplete", "items"}, []json.Value{json.FromBool(false), json.FromArray(items)})
+}
+
+// ─── Member completion (receiver '.') ────────────────────────────────────
+
+// memberItems returns completion items for members of `receiver` filtered by
+// `word`. Resolution order:
+//   1. receiver is an imported module (alias or path base name) → public
+//      declarations of that module.
+//   2. receiver is a declared type name → its members (struct fields and
+//      methods, enum variants).
+//   3. receiver is a local variable/parameter whose type can be inferred
+//      (annotation, struct literal, or constructor call) → type members.
+fn memberItems(text: string, docPath: string, receiver: string, word: string, skinkHome: string, cursorLine: int) -> []json.Value {
+    var items []json.Value
+    if str.Len(receiver) == 0 {
+        // e.g. 'foo().' — receiver is a complex expression we can't resolve.
+        return items
+    }
+
+    tokens := lexer.Tokenize(text)
+    p := parser.New(tokens)
+    decls := parser.ParseFile(&p)
+
+    seen := make(map[string]bool)
+
+    // 1. Imported module?
+    baseDir := utils.dirOf(docPath)
+    for i := 0; i < len(decls); i = i + 1 {
+        d := decls[i].decl
+        if d.kind != ast.ST_IMPORT {
+            continue
+        }
+        modName := d.importAlias
+        if str.Len(modName) == 0 {
+            modName = utils.baseName(d.importPath)
+        }
+        if !str.Equal(modName, receiver) {
+            continue
+        }
+        path := resolveImportPath(d.importPath, baseDir, skinkHome)
+        if str.Len(path) == 0 {
+            return items
+        }
+        moduleDecls := parseModuleFile(path)
+        items = addPubDeclItems(items, moduleDecls, word, seen)
+        return items
+    }
+
+    // 2. receiver is a declared type name (e.g. 'MyEnum.' or 'MyStruct.')
+    typeName := ""
+    if isDeclaredType(decls, receiver) {
+        typeName = receiver
+    }
+
+    // 3. receiver is a local variable/parameter — infer its type.
+    // cursorLine is 0-based (LSP); AST stmt lines are 1-based.
+    if str.Len(typeName) == 0 {
+        typeName = inferVarType(decls, receiver, cursorLine + 1, baseDir, skinkHome)
+    }
+    if str.Len(typeName) == 0 {
+        return items
+    }
+
+    // Qualified type "mod.Type" → look the declaration up in the module
+    // file; only public members are accessible across modules.
+    if str.Contains(typeName, ".") {
+        parts := str.Split(typeName, ".")
+        if len(parts) == 2 {
+            modDecls := findModuleDecls(decls, parts[0], baseDir, skinkHome)
+            items = addTypeMemberItems(items, modDecls, parts[1], word, seen, true)
+        }
+        return items
+    }
+
+    items = addTypeMemberItems(items, decls, typeName, word, seen, false)
+    return items
+}
+
+// isDeclaredType reports whether name is a struct/enum declared in decls.
+fn isDeclaredType(decls: []ast.Stmt, name: string) -> bool {
+    for i := 0; i < len(decls); i = i + 1 {
+        d := decls[i].decl
+        if d.kind == ast.ST_STRUCT && str.Equal(d.structName, name) {
+            return true
+        }
+        if d.kind == ast.ST_ENUM && str.Equal(d.enumName, name) {
+            return true
+        }
+        if d.kind == ast.ST_TYPEALIAS && str.Equal(d.aliasName, name) {
+            return true
+        }
+    }
+    return false
+}
+
+// addTypeMemberItems appends field/method/variant items for the type named
+// `typeName` found in `decls` and returns the updated item list. When
+// pubOnly is true (type resolved from another module), non-public fields
+// and methods are skipped.
+fn addTypeMemberItems(items: []json.Value, decls: []ast.Stmt, typeName: string, word: string, seen: map[string]bool, pubOnly: bool) -> []json.Value {
+    for i := 0; i < len(decls); i = i + 1 {
+        d := decls[i].decl
+
+        // Struct: fields + methods declared inside the struct block.
+        if d.kind == ast.ST_STRUCT && str.Equal(d.structName, typeName) {
+            for j := 0; j < len(d.structFields); j = j + 1 {
+                f := d.structFields[j]
+                if pubOnly && !f.isPub {
+                    continue
+                }
+                if str.Len(word) > 0 && !str.StartsWith(f.name, word) {
+                    continue
+                }
+                if !seen[f.name] {
+                    seen[f.name] = true
+                    detail := "field"
+                    if len(f.typ) > 0 {
+                        detail = str.Concat("field: ", ast.typeString(f.typ[0]))
+                    }
+                    items = append(items, json.FromObject([]string{"label", "kind", "detail"}, []json.Value{json.FromString(f.name), json.FromNumber(float(5)), json.FromString(detail)}))
+                }
+            }
+            for j := 0; j < len(d.structMethods); j = j + 1 {
+                if pubOnly && !d.structMethods[j].fnIsPub {
+                    continue
+                }
+                items = addMethodItem(items, d.structMethods[j], word, seen)
+            }
+        }
+
+        // Enum: variants (e.g. 'Color.Red').
+        if d.kind == ast.ST_ENUM && str.Equal(d.enumName, typeName) {
+            for j := 0; j < len(d.enumVariants); j = j + 1 {
+                v := d.enumVariants[j]
+                if str.Len(word) > 0 && !str.StartsWith(v.name, word) {
+                    continue
+                }
+                if !seen[v.name] {
+                    seen[v.name] = true
+                    items = append(items, json.FromObject([]string{"label", "kind", "detail"}, []json.Value{json.FromString(v.name), json.FromNumber(float(20)), json.FromString("enum variant")}))
+                }
+            }
+        }
+
+        // Free functions with a leading 'self' parameter act as methods.
+        if d.kind == ast.ST_FN {
+            if pubOnly && !d.fnIsPub {
+                continue
+            }
+            if len(d.fnReceiver) > 0 && str.Equal(typeNameOf(d.fnReceiver[0]), typeName) {
+                items = addMethodItem(items, d, word, seen)
+            } else if len(d.fnParams) > 0 && str.Equal(d.fnParams[0].name, "self") && len(d.fnParams[0].typ) > 0 {
+                if str.Equal(typeNameOf(d.fnParams[0].typ[0]), typeName) {
+                    items = addMethodItem(items, d, word, seen)
+                }
+            }
+        }
+    }
+    return items
+}
+
+// addMethodItem appends one Method completion item for a fn Decl.
+fn addMethodItem(items: []json.Value, d: ast.Decl, word: string, seen: map[string]bool) -> []json.Value {
+    if str.Len(word) > 0 && !str.StartsWith(d.fnName, word) {
+        return items
+    }
+    if seen[d.fnName] {
+        return items
+    }
+    seen[d.fnName] = true
+    items = append(items, json.FromObject([]string{"label", "kind", "detail"}, []json.Value{json.FromString(d.fnName), json.FromNumber(float(2)), json.FromString(fnSignature(d))}))
+    return items
+}
+
+// addPubDeclItems appends completion items for all public declarations in a
+// parsed module file and returns the updated item list.
+fn addPubDeclItems(items: []json.Value, decls: []ast.Stmt, word: string, seen: map[string]bool) -> []json.Value {
+    for i := 0; i < len(decls); i = i + 1 {
+        d := decls[i].decl
+        if d.kind == ast.ST_FN {
+            if d.fnIsPub && len(d.fnReceiver) == 0 {
+                items = addNamedItem(items, d.fnName, 3, fnSignature(d), word, seen)
+            }
+        } else if d.kind == ast.ST_STRUCT {
+            if d.structIsPub {
+                items = addNamedItem(items, d.structName, 22, "struct", word, seen)
+            }
+        } else if d.kind == ast.ST_ENUM {
+            if d.enumIsPub {
+                items = addNamedItem(items, d.enumName, 13, "enum", word, seen)
+                for j := 0; j < len(d.enumVariants); j = j + 1 {
+                    items = addNamedItem(items, d.enumVariants[j].name, 20, "enum variant", word, seen)
+                }
+            }
+        } else if d.kind == ast.ST_CONST {
+            if d.constIsPub {
+                items = addNamedItem(items, d.constName, 21, "const", word, seen)
+                for j := 0; j < len(d.constBlock); j = j + 1 {
+                    items = addNamedItem(items, d.constBlock[j].name, 21, "const", word, seen)
+                }
+            }
+        } else if d.kind == ast.ST_TYPEALIAS {
+            items = addNamedItem(items, d.aliasName, 22, "type", word, seen)
+        } else if d.kind == ast.ST_TEMPLATE {
+            if d.templateIsPub {
+                items = addNamedItem(items, d.templateName, 8, "template", word, seen)
+            }
+        } else if d.kind == ast.ST_SERVICE {
+            if d.serviceIsPub {
+                items = addNamedItem(items, d.serviceName, 8, "service", word, seen)
+            }
+        } else if d.kind == ast.ST_RULESET {
+            if d.rulesetIsPub {
+                items = addNamedItem(items, d.rulesetName, 22, "ruleset", word, seen)
+            }
+        }
+    }
+    return items
+}
+
+// addNamedItem appends one completion item if it passes the word filter and
+// hasn't been added yet, returning the updated item list.
+fn addNamedItem(items: []json.Value, name: string, kind: int, detail: string, word: string, seen: map[string]bool) -> []json.Value {
+    if str.Len(name) == 0 {
+        return items
+    }
+    if str.Len(word) > 0 && !str.StartsWith(name, word) {
+        return items
+    }
+    if seen[name] {
+        return items
+    }
+    seen[name] = true
+    items = append(items, json.FromObject([]string{"label", "kind", "detail"}, []json.Value{json.FromString(name), json.FromNumber(float(kind)), json.FromString(detail)}))
+    return items
+}
+
+// fnSignature builds a compact "fn name(a: T, b: U) -> R" detail string.
+fn fnSignature(d: ast.Decl) -> string {
+    sig := str.Concat("fn ", str.Concat(d.fnName, "("))
+    for i := 0; i < len(d.fnParams); i = i + 1 {
+        if i > 0 {
+            sig = str.Concat(sig, ", ")
+        }
+        sig = str.Concat(sig, d.fnParams[i].name)
+        if len(d.fnParams[i].typ) > 0 {
+            sig = str.Concat(sig, str.Concat(": ", ast.typeString(d.fnParams[i].typ[0])))
+        }
+    }
+    sig = str.Concat(sig, ")")
+    if len(d.fnRetTypes) > 0 {
+        sig = str.Concat(sig, " -> ")
+        for i := 0; i < len(d.fnRetTypes); i = i + 1 {
+            if i > 0 {
+                sig = str.Concat(sig, ", ")
+            }
+            sig = str.Concat(sig, ast.typeString(d.fnRetTypes[i]))
+        }
+    }
+    return sig
+}
+
+// ─── Variable type inference ─────────────────────────────────────────────
+
+// inferVarType finds the type of a local variable or parameter named `name`,
+// preferring the binding that appears closest above the cursor line.
+// cursorLine is 1-based. Returns a possibly-qualified type name
+// ("Type" or "mod.Type"), or "".
+fn inferVarType(decls: []ast.Stmt, name: string, cursorLine: int, baseDir: string, skinkHome: string) -> string {
+    best := ""
+    bestLine := -1
+
+    for i := 0; i < len(decls); i = i + 1 {
+        d := decls[i].decl
+
+        // Top-level variable declarations.
+        if decls[i].kind == ast.ST_VARDECL && str.Equal(decls[i].varName, name) {
+            t := ""
+            if len(decls[i].varType) > 0 {
+                t = typeNameOf(decls[i].varType[0])
+            } else if len(decls[i].varValue) > 0 {
+                t = exprTypeName(decls[i].varValue[0], decls, baseDir, skinkHome)
+            }
+            if str.Len(t) > 0 && decls[i].line <= cursorLine && decls[i].line > bestLine {
+                best = t
+                bestLine = decls[i].line
+            }
+        }
+
+        if d.kind != ast.ST_FN {
+            continue
+        }
+
+        // Function parameters (including 'self').
+        for j := 0; j < len(d.fnParams); j = j + 1 {
+            prm := d.fnParams[j]
+            if str.Equal(prm.name, name) && len(prm.typ) > 0 {
+                t := typeNameOf(prm.typ[0])
+                if str.Len(t) > 0 && decls[i].line <= cursorLine && decls[i].line > bestLine {
+                    best = t
+                    bestLine = decls[i].line
+                }
+            }
+        }
+
+        // Local variable declarations inside the function body.
+        best, bestLine = walkStmtsForVar(d.fnBody, decls, name, cursorLine, best, bestLine, baseDir, skinkHome)
+    }
+    return best
+}
+
+// walkStmtsForVar recursively scans statements for a declaration of `name`
+// and keeps the best (latest line <= cursorLine) type binding found.
+fn walkStmtsForVar(stmts: []ast.Stmt, decls: []ast.Stmt, name: string, cursorLine: int, best: string, bestLine: int, baseDir: string, skinkHome: string) -> (string, int) {
+    for i := 0; i < len(stmts); i = i + 1 {
+        st := stmts[i]
+
+        if st.kind == ast.ST_VARDECL || st.kind == ast.ST_VAR {
+            if str.Equal(st.varName, name) {
+                t := ""
+                if len(st.varType) > 0 {
+                    t = typeNameOf(st.varType[0])
+                } else if len(st.varValue) > 0 {
+                    t = exprTypeName(st.varValue[0], decls, baseDir, skinkHome)
+                }
+                if str.Len(t) > 0 && st.line <= cursorLine && st.line > bestLine {
+                    best = t
+                    bestLine = st.line
+                }
+            }
+        }
+
+        // Recurse into nested bodies.
+        best, bestLine = walkStmtsForVar(st.thenBody, decls, name, cursorLine, best, bestLine, baseDir, skinkHome)
+        best, bestLine = walkStmtsForVar(st.elseBody, decls, name, cursorLine, best, bestLine, baseDir, skinkHome)
+        best, bestLine = walkStmtsForVar(st.ifInit, decls, name, cursorLine, best, bestLine, baseDir, skinkHome)
+        best, bestLine = walkStmtsForVar(st.forInit, decls, name, cursorLine, best, bestLine, baseDir, skinkHome)
+        best, bestLine = walkStmtsForVar(st.forPost, decls, name, cursorLine, best, bestLine, baseDir, skinkHome)
+        best, bestLine = walkStmtsForVar(st.deferStmt, decls, name, cursorLine, best, bestLine, baseDir, skinkHome)
+        for j := 0; j < len(st.matchArms); j = j + 1 {
+            best, bestLine = walkStmtsForVar(st.matchArms[j].body, decls, name, cursorLine, best, bestLine, baseDir, skinkHome)
+        }
+        for j := 0; j < len(st.selectCases); j = j + 1 {
+            best, bestLine = walkStmtsForVar(st.selectCases[j].body, decls, name, cursorLine, best, bestLine, baseDir, skinkHome)
+        }
+    }
+    return best, bestLine
+}
+
+// typeNameOf extracts a simple (possibly qualified) type name from an
+// ast.Type: Named → its name; Pointer → name of the pointee.
+// Composite types (slice/map/chan/func) have no member type → "".
+fn typeNameOf(t: ast.Type) -> string {
+    if t.kind == ast.TY_NAMED {
+        return t.name
+    }
+    if t.kind == ast.TY_POINTER && len(t.elem) > 0 {
+        return typeNameOf(t.elem[0])
+    }
+    return ""
+}
+
+// exprTypeName infers a type name from an initializing expression:
+//   T{...}              → "T"
+//   f(...)              → return type of local fn f
+//   mod.f(...)          → "mod.RetType" (qualified for module lookup)
+//   (expr)              → inner expression
+//   &T{...} / *T        → T
+fn exprTypeName(e: ast.Expr, decls: []ast.Stmt, baseDir: string, skinkHome: string) -> string {
+    if e.kind == ast.EX_STRUCT_LIT {
+        return e.structLitName
+    }
+    if e.kind == ast.EX_PAREN && len(e.inner) > 0 {
+        return exprTypeName(e.inner[0], decls, baseDir, skinkHome)
+    }
+    if e.kind == ast.EX_PREFIX && len(e.prefixRight) > 0 {
+        // &T{...} and similar
+        return exprTypeName(e.prefixRight[0], decls, baseDir, skinkHome)
+    }
+    if e.kind == ast.EX_CALL && len(e.callFunc) > 0 {
+        callee := e.callFunc[0]
+        if callee.kind == ast.EX_IDENT {
+            fnDecl := findFnDecl(decls, callee.ident)
+            if len(fnDecl.fnRetTypes) > 0 {
+                return typeNameOf(fnDecl.fnRetTypes[0])
+            }
+        }
+        if callee.kind == ast.EX_FIELD && len(callee.fieldTarget) > 0 {
+            tgt := callee.fieldTarget[0]
+            if tgt.kind == ast.EX_IDENT {
+                // mod.Fn(...) — resolve the module file, find the function's
+                // return type, and qualify it as "mod.Type" so the caller can
+                // locate the struct declaration inside the module file.
+                modDecls := findModuleDecls(decls, tgt.ident, baseDir, skinkHome)
+                fnDecl := findFnDecl(modDecls, callee.fieldName)
+                if len(fnDecl.fnRetTypes) > 0 {
+                    retName := typeNameOf(fnDecl.fnRetTypes[0])
+                    if str.Len(retName) > 0 {
+                        return str.Concat(tgt.ident, str.Concat(".", retName))
+                    }
+                }
+            }
+        }
+    }
+    return ""
+}
+
+// findFnDecl returns the Decl for a top-level function named `name`
+// (unqualified local name), or an empty Decl when absent.
+fn findFnDecl(decls: []ast.Stmt, name: string) -> ast.Decl {
+    for i := 0; i < len(decls); i = i + 1 {
+        d := decls[i].decl
+        if d.kind == ast.ST_FN && str.Equal(d.fnName, name) {
+            return d
+        }
+    }
+    return ast.Decl{kind: 0}
+}
+
+// ─── Import resolution (mirrors std/resolver.skink) ──────────────────────
+
+// parseModuleFile lexes+parses a module source file and returns its decls.
+fn parseModuleFile(path: string) -> []ast.Stmt {
+    src := utils.readFileText(path)
+    if str.Len(src) == 0 {
+        return []ast.Stmt{}
+    }
+    toks := lexer.Tokenize(src)
+    mp := parser.New(toks)
+    return parser.ParseFile(&mp)
+}
+
+// findModuleDecls locates the import whose module name (alias or base name)
+// equals `mod`, resolves it, and returns its parsed declarations.
+fn findModuleDecls(decls: []ast.Stmt, mod: string, baseDir: string, skinkHome: string) -> []ast.Stmt {
+    for i := 0; i < len(decls); i = i + 1 {
+        d := decls[i].decl
+        if d.kind != ast.ST_IMPORT {
+            continue
+        }
+        modName := d.importAlias
+        if str.Len(modName) == 0 {
+            modName = utils.baseName(d.importPath)
+        }
+        if !str.Equal(modName, mod) {
+            continue
+        }
+        path := resolveImportPath(d.importPath, baseDir, skinkHome)
+        if str.Len(path) == 0 {
+            return []ast.Stmt{}
+        }
+        return parseModuleFile(path)
+    }
+    return []ast.Stmt{}
+}
+
+// resolveImportPath locates the physical file for an import path using the
+// same search order as the compiler's resolver (std/resolver.skink):
+// overlay of SKINK_HOME for std/, the importing file's directory, then
+// vendor/, .skink/cache/, std/, and direct paths walking up the tree,
+// finally SKINK_HOME and SKINK_HOME/cache.
+fn resolveImportPath(importPath: string, baseDir: string, skinkHome: string) -> string {
+    if str.StartsWith(importPath, "C:") {
+        return ""
+    }
+    if str.Equal(importPath, "testing") {
+        importPath = "std/testing"
+    }
+
+    if str.StartsWith(importPath, "std/") && str.Len(skinkHome) > 0 {
+        overlay := utils.dirOf(skinkHome)
+        candidate := tryImportPath(overlay, importPath)
+        if str.Len(candidate) > 0 {
+            return candidate
+        }
+    }
+
+    candidate := tryImportPath(baseDir, importPath)
+    if str.Len(candidate) > 0 {
+        return candidate
+    }
+
+    current := baseDir
+    for {
+        candidate = tryImportPath(utils.joinPath(current, "vendor"), importPath)
+        if str.Len(candidate) > 0 {
+            return candidate
+        }
+        candidate = tryImportPath(utils.joinPath(utils.joinPath(current, ".skink"), "cache"), importPath)
+        if str.Len(candidate) > 0 {
+            return candidate
+        }
+        candidate = tryImportPath(utils.joinPath(current, "std"), importPath)
+        if str.Len(candidate) > 0 {
+            return candidate
+        }
+        candidate = tryImportPath(current, importPath)
+        if str.Len(candidate) > 0 {
+            return candidate
+        }
+        parent := utils.dirOf(current)
+        if str.Equal(parent, current) {
+            break
+        }
+        current = parent
+    }
+
+    if str.Len(skinkHome) > 0 {
+        candidate = tryImportPath(skinkHome, importPath)
+        if str.Len(candidate) > 0 {
+            return candidate
+        }
+        candidate = tryImportPath(utils.joinPath(skinkHome, "cache"), importPath)
+        if str.Len(candidate) > 0 {
+            return candidate
+        }
+    }
+    return ""
+}
+
+// tryImportPath checks the three candidate layouts for an import path
+// under base: <base>/<path>.skink, <base>/<path>/main.skink, and
+// <base>/<path>/<basename>.skink.
+fn tryImportPath(base: string, importPath: string) -> string {
+    candidate := utils.joinPath(base, str.Concat(importPath, ".skink"))
+    if utils.fileExists(candidate) {
+        return candidate
+    }
+    candidate = utils.joinPath(utils.joinPath(base, importPath), "main.skink")
+    if utils.fileExists(candidate) {
+        return candidate
+    }
+    candidate = utils.joinPath(utils.joinPath(base, importPath), str.Concat(utils.baseName(importPath), ".skink"))
+    if utils.fileExists(candidate) {
+        return candidate
+    }
+    return ""
+}
+
+// extractIdentifiers tokenizes the document and collects unique identifiers.
+fn extractIdentifiers(text: string) -> []string {
+    tokens := lexer.Tokenize(text)
+    var idents []string
+    for i := 0; i < len(tokens); i = i + 1 {
+        tok := tokens[i]
+        if tok.kind == lexer.T_IDENT {
+            // Check if already collected
+            found := false
+            for j := 0; j < len(idents); j = j + 1 {
+                if str.Equal(idents[j], tok.literal) {
+                    found = true
+                    break
+                }
+            }
+            if !found {
+                idents = append(idents, tok.literal)
+            }
+        }
+    }
+    return idents
+}
+
+
+
+
+
+
+
+

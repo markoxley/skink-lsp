@@ -1,0 +1,416 @@
+// Module hover provides hover information for the LSP server.
+//
+// When the user hovers over a symbol, this module provides type information,
+// declaration details, and documentation comments extracted from the source.
+module hover
+
+import "std/json"
+import "std/str"
+import "std/lexer"
+import "std/parser"
+import "std/ast"
+import "lsp/documents"
+import "lsp/utils"
+
+// provide returns hover information at the given position.
+pub fn provide(dm: *documents.DocumentManager, params: json.Value) -> json.Value {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+    pos := json.ObjectGet(params, "position")
+    line := int(json.AsNumber(json.ObjectGet(pos, "line")))
+    character := int(json.AsNumber(json.ObjectGet(pos, "character")))
+    text, ok := documents.getText(dm, uri)
+    if !ok {
+        return json.Null()
+    }
+    // Find the word at the cursor position
+    word := utils.extractWordAt(text, line, character)
+    if str.Len(word) == 0 {
+        return json.Null()
+    }
+    // Tokenize and parse to find symbol information
+    tokens := lexer.Tokenize(text)
+    p := parser.New(tokens)
+    decls := parser.ParseFile(&p)
+    // Search for the word in declarations
+    hoverText := findHoverInfo(decls, word, text)
+    if str.Len(hoverText) == 0 {
+        // If not found in declarations, check if it's a keyword
+        hoverText = keywordHover(word)
+    }
+    if str.Len(hoverText) == 0 {
+        return json.Null()
+    }
+    // Build the hover response
+    content := json.FromObject([]string{"kind", "value"}, []json.Value{json.FromString("markdown"), json.FromString(hoverText)})
+    rangeStart := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(line)), json.FromNumber(float(character))})
+    rangeEnd := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(line)), json.FromNumber(float(character) + str.Len(word))})
+    rangeVal := json.FromObject([]string{"start", "end"}, []json.Value{rangeStart, rangeEnd})
+    return json.FromObject([]string{"contents", "range"}, []json.Value{content, rangeVal})
+}
+// findHoverInfo searches declarations for the given word and returns hover text.
+fn findHoverInfo(decls: []ast.Stmt, word: string, text: string) -> string {
+    for i := 0; i < len(decls); i = i + 1 {
+        d := decls[i].decl
+        if d.kind == ast.ST_FN && str.Equal(d.fnName, word) {
+            return buildFnHover(d, decls[i])
+        }
+        if d.kind == ast.ST_STRUCT && str.Equal(d.structName, word) {
+            return buildStructHover(d, decls[i])
+        }
+        if d.kind == ast.ST_ENUM && str.Equal(d.enumName, word) {
+            return buildEnumHover(d, decls[i])
+        }
+        if d.kind == ast.ST_CONST && str.Equal(d.constName, word) {
+            return buildConstHover(d, decls[i])
+        }
+        if d.kind == ast.ST_TYPEALIAS && str.Equal(d.aliasName, word) {
+            return buildTypeAliasHover(d, decls[i])
+        }
+        if decls[i].kind == ast.ST_VARDECL && str.Equal(decls[i].varName, word) {
+            return buildVarHover(decls[i])
+        }
+        if d.kind == ast.ST_EXTERN && str.Equal(d.fnName, word) {
+            return str.Concat("```skink\nextern ", str.Concat(buildFnSignature(d), "\n```"))
+        }
+        if d.kind == ast.ST_TEMPLATE && str.Equal(d.templateName, word) {
+            return buildTemplateHover(d)
+        }
+        if d.kind == ast.ST_SERVICE && str.Equal(d.serviceName, word) {
+            return buildServiceHover(d)
+        }
+        if d.kind == ast.ST_RULESET && str.Equal(d.rulesetName, word) {
+            return buildRulesetHover(d)
+        }
+        // Check struct fields
+        if d.kind == ast.ST_STRUCT {
+            for j := 0; j < len(d.structFields); j = j + 1 {
+                if str.Equal(d.structFields[j].name, word) {
+                    return buildFieldHover(d.structFields[j])
+                }
+            }
+        }
+        // Check function parameters
+        if d.kind == ast.ST_FN {
+            for j := 0; j < len(d.fnParams); j = j + 1 {
+                if str.Equal(d.fnParams[j].name, word) {
+                    return buildParamHover(d.fnParams[j])
+                }
+            }
+        }
+    }
+    return ""
+}
+// buildFnHover builds hover text for a function declaration.
+fn buildFnHover(d: ast.Decl, stmt: ast.Stmt) -> string {
+    sig := buildFnSignature(d)
+    doc := findDocComment(stmt)
+    if str.Len(doc) > 0 {
+        return str.Concat(str.Concat("```skink\n", sig), str.Concat("\n```\n\n", doc))
+    }
+    return str.Concat(str.Concat("```skink\n", sig), "\n```")
+}
+// buildStructHover builds hover text for a struct declaration.
+fn buildStructHover(d: ast.Decl, stmt: ast.Stmt) -> string {
+    result := str.Concat("```skink\nstruct ", d.structName)
+    if len(d.structGenerics) > 0 {
+        result = str.Concat(result, "<")
+        for i := 0; i < len(d.structGenerics); i = i + 1 {
+            if i > 0 {
+                result = str.Concat(result, ", ")
+            }
+            result = str.Concat(result, d.structGenerics[i].name)
+        }
+        result = str.Concat(result, ">")
+    }
+    result = str.Concat(result, " {\n")
+    for i := 0; i < len(d.structFields); i = i + 1 {
+        f := d.structFields[i]
+        result = str.Concat(result, "    ")
+        if f.isPub {
+            result = str.Concat(result, "pub ")
+        }
+        result = str.Concat(result, f.name)
+        result = str.Concat(result, ": ")
+        if len(f.typ) > 0 {
+            result = str.Concat(result, ast.typeString(f.typ[0]))
+        }
+        result = str.Concat(result, "\n")
+    }
+    result = str.Concat(result, "}\n```")
+    return result
+}
+// buildEnumHover builds hover text for an enum/tagged union declaration.
+fn buildEnumHover(d: ast.Decl, stmt: ast.Stmt) -> string {
+    result := str.Concat("```skink\nenum ", d.enumName)
+    result = str.Concat(result, " {\n")
+    for i := 0; i < len(d.enumVariants); i = i + 1 {
+        v := d.enumVariants[i]
+        result = str.Concat(result, "    ")
+        result = str.Concat(result, v.name)
+        if len(v.payloads) > 0 {
+            result = str.Concat(result, "(")
+            for j := 0; j < len(v.payloads); j = j + 1 {
+                if j > 0 {
+                    result = str.Concat(result, ", ")
+                }
+                result = str.Concat(result, ast.typeString(v.payloads[j]))
+            }
+            result = str.Concat(result, ")")
+        }
+        result = str.Concat(result, "\n")
+    }
+    result = str.Concat(result, "}\n```")
+    return result
+}
+// buildConstHover builds hover text for a constant.
+fn buildConstHover(d: ast.Decl, stmt: ast.Stmt) -> string {
+    result := str.Concat("```skink\nconst ", d.constName)
+    if len(d.constValue) > 0 {
+        result = str.Concat(result, " = ")
+        result = str.Concat(result, exprToString(d.constValue[0]))
+    }
+    result = str.Concat(result, "\n```")
+    return result
+}
+// buildTypeAliasHover builds hover text for a type alias.
+fn buildTypeAliasHover(d: ast.Decl, stmt: ast.Stmt) -> string {
+    result := str.Concat("```skink\ntype ", d.aliasName)
+    if len(d.aliasType) > 0 {
+        result = str.Concat(result, " = ")
+        result = str.Concat(result, ast.typeString(d.aliasType[0]))
+    }
+    result = str.Concat(result, "\n```")
+    return result
+}
+// buildFieldHover builds hover text for a struct field.
+fn buildFieldHover(f: ast.Field) -> string {
+    result := "```skink\n"
+    if f.isPub {
+        result = str.Concat(result, "pub ")
+    }
+    result = str.Concat(result, f.name)
+    result = str.Concat(result, ": ")
+    if len(f.typ) > 0 {
+        result = str.Concat(result, ast.typeString(f.typ[0]))
+    }
+    result = str.Concat(result, "\n```")
+    if str.Len(f.doc) > 0 {
+        result = str.Concat(result, str.Concat("\n\n", f.doc))
+    }
+    return result
+}
+// buildParamHover builds hover text for a function parameter.
+fn buildParamHover(p: ast.Param) -> string {
+    result := str.Concat("```skink\n", p.name)
+    if len(p.typ) > 0 {
+        result = str.Concat(result, ": ")
+        result = str.Concat(result, ast.typeString(p.typ[0]))
+    }
+    result = str.Concat(result, "\n```")
+    return result
+}
+// buildVarHover builds hover text for a module-level variable declaration.
+fn buildVarHover(stmt: ast.Stmt) -> string {
+    result := str.Concat("```skink\nvar ", stmt.varName)
+    if len(stmt.varType) > 0 {
+        result = str.Concat(result, ": ")
+        result = str.Concat(result, ast.typeString(stmt.varType[0]))
+    }
+    result = str.Concat(result, "\n```")
+    return result
+}
+// buildTemplateHover builds hover text for a template declaration.
+fn buildTemplateHover(d: ast.Decl) -> string {
+    result := str.Concat("```skink\ntemplate ", d.templateName)
+    if len(d.templateGenerics) > 0 {
+        result = str.Concat(result, "<")
+        for i := 0; i < len(d.templateGenerics); i = i + 1 {
+            if i > 0 {
+                result = str.Concat(result, ", ")
+            }
+            result = str.Concat(result, d.templateGenerics[i].name)
+        }
+        result = str.Concat(result, ">")
+    }
+    result = str.Concat(result, " {\n")
+    for i := 0; i < len(d.templateMethods); i = i + 1 {
+        result = str.Concat(result, "    ")
+        result = str.Concat(result, buildFnSignature(d.templateMethods[i]))
+        result = str.Concat(result, "\n")
+    }
+    result = str.Concat(result, "}\n```")
+    return result
+}
+// buildServiceHover builds hover text for a service declaration.
+fn buildServiceHover(d: ast.Decl) -> string {
+    result := str.Concat("```skink\nservice ", d.serviceName)
+    if str.Len(d.serviceForType) > 0 {
+        result = str.Concat(result, " for ")
+        result = str.Concat(result, d.serviceForType)
+    }
+    result = str.Concat(result, " {\n")
+    for i := 0; i < len(d.serviceMethods); i = i + 1 {
+        result = str.Concat(result, "    ")
+        result = str.Concat(result, buildFnSignature(d.serviceMethods[i]))
+        result = str.Concat(result, "\n")
+    }
+    result = str.Concat(result, "}\n```")
+    return result
+}
+// buildRulesetHover builds hover text for a ruleset declaration.
+fn buildRulesetHover(d: ast.Decl) -> string {
+    result := str.Concat("```skink\nruleset ", d.rulesetName)
+    result = str.Concat(result, " {\n")
+    for i := 0; i < len(d.rulesetRules); i = i + 1 {
+        result = str.Concat(result, "    rule ")
+        result = str.Concat(result, d.rulesetRules[i].name)
+        result = str.Concat(result, "\n")
+    }
+    result = str.Concat(result, "}\n```")
+    return result
+}
+// buildFnSignature builds a function signature string.
+fn buildFnSignature(d: ast.Decl) -> string {
+    sig := "fn "
+    if d.fnIsPub {
+        sig = str.Concat("pub ", sig)
+    }
+    sig = str.Concat(sig, d.fnName)
+    sig = str.Concat(sig, "(")
+    for i := 0; i < len(d.fnParams); i = i + 1 {
+        if i > 0 {
+            sig = str.Concat(sig, ", ")
+        }
+        sig = str.Concat(sig, d.fnParams[i].name)
+        if len(d.fnParams[i].typ) > 0 {
+            sig = str.Concat(sig, ": ")
+            sig = str.Concat(sig, ast.typeString(d.fnParams[i].typ[0]))
+        }
+    }
+    sig = str.Concat(sig, ")")
+    if len(d.fnRetTypes) > 0 {
+        sig = str.Concat(sig, " -> ")
+        for i := 0; i < len(d.fnRetTypes); i = i + 1 {
+            if i > 0 {
+                sig = str.Concat(sig, ", ")
+            }
+            sig = str.Concat(sig, ast.typeString(d.fnRetTypes[i]))
+        }
+    }
+    return sig
+}
+// findDocComment looks for a doc comment (// or ///) preceding a declaration.
+fn findDocComment(stmt: ast.Stmt) -> string {
+    // Doc comments are stored in the AST if the parser captures them.
+    // For now, return empty — a full implementation would scan backwards
+    // from the declaration line for /// comments.
+    return ""
+}
+// exprToString converts an expression to a string representation.
+fn exprToString(e: ast.Expr) -> string {
+    if e.kind == ast.EX_INT {
+        return utils.intToStr(e.intVal)
+    }
+    if e.kind == ast.EX_FLOAT {
+        return "float"
+    }
+    if e.kind == ast.EX_STRING {
+        return str.Concat("\"", str.Concat(e.strVal, "\""))
+    }
+    if e.kind == ast.EX_BOOL {
+        if e.boolVal {
+            return "true"
+        }
+        return "false"
+    }
+    if e.kind == ast.EX_IDENT {
+        return e.ident
+    }
+    return "..."
+}
+// keywordHover returns hover text for Skink keywords.
+fn keywordHover(word: string) -> string {
+    if str.Equal(word, "fn") {
+        return "```skink\nfn name(params) -> returnType { body }\n```\n\nDeclares a function."
+    }
+    if str.Equal(word, "struct") {
+        return "```skink\nstruct Name {\n    field: type\n}\n```\n\nDeclares a struct type."
+    }
+    if str.Equal(word, "enum") {
+        return "```skink\nenum Name {\n    Variant,\n    VariantWithPayload(type),\n}\n```\n\nDeclares a tagged union / enum."
+    }
+    if str.Equal(word, "match") {
+        return "```skink\nmatch subject {\n    pattern => body\n    _ => default\n}\n```\n\nPattern matching expression."
+    }
+    if str.Equal(word, "for") {
+        return "```skink\nfor i := 0; i < n; i = i + 1 { body }\n```\n\nC-style for loop."
+    }
+    if str.Equal(word, "while") {
+        return "```skink\nwhile condition { body }\n```\n\nWhile loop."
+    }
+    if str.Equal(word, "if") {
+        return "```skink\nif condition { body } else { alternative }\n```\n\nConditional statement."
+    }
+    if str.Equal(word, "import") {
+        return "```skink\nimport \"std/module\"\n```\n\nImports a module."
+    }
+    if str.Equal(word, "module") {
+        return "```skink\nmodule name\n```\n\nDeclares the module name."
+    }
+    if str.Equal(word, "defer") {
+        return "```skink\ndefer funcall()\n```\n\nDefers function execution until the enclosing function returns."
+    }
+    if str.Equal(word, "spawn") {
+        return "```skink\nspawn funcall()\n```\n\nSpawns a new concurrent task."
+    }
+    if str.Equal(word, "async") {
+        return "```skink\nasync funcall()\n```\n\nRuns a function asynchronously, returning a future."
+    }
+    if str.Equal(word, "await") {
+        return "```skink\nawait future\n```\n\nBlocks until a future completes and yields its result."
+    }
+    if str.Equal(word, "select") {
+        return "```skink\nselect {\n    case msg := <-ch:\n        ...\n    default:\n        ...\n}\n```\n\nWaits on multiple channel operations."
+    }
+    if str.Equal(word, "until") {
+        return "```skink\nuntil condition { body }\n```\n\nLoops until the condition becomes true."
+    }
+    if str.Equal(word, "ruleset") {
+        return "```skink\nruleset Name {\n    rule name when condition {\n        action: { ... }\n        priority: N\n    }\n}\n```\n\nDeclares a set of condition-action rules."
+    }
+    if str.Equal(word, "service") {
+        return "```skink\nservice Name for Type {\n    fn method(args) -> ret\n}\n```\n\nDeclares a service interface or implementation."
+    }
+    if str.Equal(word, "template") {
+        return "```skink\ntemplate Name {\n    fn method(self: Name) -> ret\n}\n```\n\nDeclares a template (duck-typed interface)."
+    }
+    if str.Equal(word, "tensor") {
+        return "`tensor` is the built-in multi-dimensional array type."
+    }
+    if str.Equal(word, "impl") {
+        return "`impl` is a reserved keyword."
+    }
+    if str.Equal(word, "iota") {
+        return "`iota` is a reserved keyword."
+    }
+    if str.Equal(word, "return") {
+        return "```skink\nreturn value\n```\n\nReturns a value from the enclosing function."
+    }
+    if str.Equal(word, "pub") {
+        return "`pub` makes a declaration visible outside its module."
+    }
+    if str.Equal(word, "const") {
+        return "```skink\nconst NAME = value\n```\n\nDeclares a constant."
+    }
+    if str.Equal(word, "var") {
+        return "```skink\nvar name type\n```\n\nDeclares a variable with a zero value."
+    }
+    if str.Equal(word, "type") {
+        return "```skink\ntype Name = UnderlyingType\n```\n\nDeclares a type alias."
+    }
+    if str.Equal(word, "extern") {
+        return "```skink\nextern fn name(params) -> ret\n```\n\nDeclares an external (C) function."
+    }
+    return ""
+}

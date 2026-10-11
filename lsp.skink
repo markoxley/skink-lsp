@@ -1,0 +1,798 @@
+// skink-lsp: A Language Server Protocol implementation for Skink, written in Skink.
+//
+// This is the main entry point. It reads LSP messages from stdin (framed with
+// Content-Length headers), dispatches them to the appropriate handlers, and
+// writes responses to stdout.
+//
+// The server uses the Skink standard library's lexer, parser, resolver, and
+// checker modules for language analysis, and the json module for JSON-RPC.
+module main
+
+import "std/json"
+import "std/errors"
+import "std/str"
+import "std/libc"
+import "std/buf"
+import "std/lexer"
+import "std/strconv"
+import "std/os"
+import "lsp/documents"
+import "lsp/diagnostics"
+import "lsp/completion"
+import "lsp/symbols"
+import "lsp/hover"
+import "lsp/definition"
+import "lsp/formatting"
+import "lsp/utils"
+import "version"
+
+// POSIX I/O wrappers for stdin/stdout.
+extern fn read(fd: int, buf: string, count: int) -> int
+extern fn write(fd: int, buf: string, count: int) -> int
+extern fn ioctl(fd: int, request: int64, argp: *int) -> int
+
+// stdinPending returns true when unread bytes are already waiting on stdin
+// (FIONREAD). Used to skip diagnostic passes for document states that are
+// already stale — e.g. when the user is still typing and a newer didChange is
+// sitting in the input queue — so bursts of edits don't pile up redundant
+// work ahead of completion/hover requests.
+fn stdinPending() -> bool {
+    n := 0
+    if ioctl(0, 0x541B, &n) < 0 {
+        return false
+    }
+    return n > 0
+}
+
+// ─── LSP Server State ────────────────────────────────────────────────────
+
+// Server holds the complete state of the language server.
+struct Server {
+    initialized: bool
+    shutdown: bool
+    exit: bool
+    rootPath: string
+    skinkHome: string
+    docs: documents.DocumentManager
+    nextRequestId: int
+}
+
+// newServer creates a new LSP server with empty state.
+fn newServer() -> Server {
+    s := Server{}
+    s.initialized = false
+    s.shutdown = false
+    s.exit = false
+    s.rootPath = ""
+    s.skinkHome = os.Getenv("SKINK_HOME")
+    if int64(s.skinkHome) == 0 || str.Len(s.skinkHome) == 0 {
+        s.skinkHome = "/usr/local/lib/skink/std"
+    }
+    s.docs = documents.newDocumentManager()
+    s.nextRequestId = 1
+    return s
+}
+
+// ─── LSP Message Transport (Content-Length framing) ──────────────────────
+
+// readMessage reads a single LSP message from stdin.
+// LSP messages are framed as:
+    //   Content-Length: N\r\n
+    //   \r\n
+    //   <N bytes of JSON>
+    // Returns the JSON body string, or empty string with eof=true on EOF.
+    fn readMessage() -> (string, bool) {
+        // Read headers until we find an empty line (\r\n\r\n)
+        contentLength := 0
+        ch := libc.malloc(1)
+
+        // Read header lines
+        for {
+            line, eof := readLine(ch)
+            if eof {
+                libc.free(ch)
+                return "", true
+            }
+            // Empty line (just \r\n or \n) signals end of headers
+            if str.Len(line) == 0 || str.Equal(line, "\r") {
+                libc.free(line)
+                break
+            }
+            // Parse Content-Length header
+            if str.StartsWith(line, "Content-Length:") {
+                valStart := 15
+                if valStart < str.Len(line) {
+                    val := str.Trim(str.Substr(line, valStart, str.Len(line) - valStart))
+                    parsed, ok := strconv.ParseInt(val)
+                    if ok {
+                        contentLength = parsed
+                    }
+                    libc.free(val)
+                }
+            }
+            libc.free(line)
+        }
+
+        libc.free(ch)
+        if contentLength <= 0 {
+            return "", false
+        }
+
+        // Read the JSON body (exactly contentLength bytes)
+        body := libc.malloc(contentLength + 1)
+        readSoFar := 0
+        for readSoFar < contentLength {
+            n := read(0, string(int64(body) + int64(readSoFar)), contentLength - readSoFar)
+            if n <= 0 {
+                libc.free(body)
+                return "", true
+            }
+            readSoFar = readSoFar + n
+        }
+        body[contentLength] = 0
+        return body, false
+    }
+
+    // readLine reads a single line from stdin (terminated by \n).
+    // The returned string includes the trailing \r if present but not the \n.
+    // Uses the provided 1-byte buffer to avoid repeated allocations.
+    fn readLine(ch: string) -> (string, bool) {
+        buffer := buf.NewBuffer()
+        for {
+            n := read(0, ch, 1)
+            if n <= 0 {
+                buffer.Free()
+                return "", true
+            }
+            if ch[0] == 10 { // '\n'
+                result := buffer.String()
+                buffer.Free()
+                return result, false
+            }
+            buffer.WriteByte(int(ch[0]))
+        }
+    }
+
+// writeMessage writes an LSP response message to stdout.
+// Frames the given JSON string with a Content-Length header.
+fn writeMessage(jsonStr: string) {
+    header := str.Concat("Content-Length: ", str.Concat(strconv.Itoa(str.Len(jsonStr)), "\r\n\r\n"))
+    write(1, header, str.Len(header))
+    write(1, jsonStr, str.Len(jsonStr))
+}
+
+// ─── JSON-RPC Response Helpers ───────────────────────────────────────────
+
+// sendResponse sends a successful JSON-RPC response with the given id and result.
+fn sendResponse(id: json.Value, result: json.Value) {
+    keys := []string{"jsonrpc", "id", "result"}
+    vals := []json.Value{json.FromString("2.0"), id, result}
+    resp := json.FromObject(keys, vals)
+    respStr := json.MarshalValue(resp)
+    writeMessage(respStr)
+    libc.free(respStr)
+}
+
+// sendErrorResponse sends a JSON-RPC error response.
+fn sendErrorResponse(id: json.Value, code: int, message: string) {
+    errKeys := []string{"code", "message"}
+    errVals := []json.Value{json.FromNumber(float(code)), json.FromString(message)}
+    errObj := json.FromObject(errKeys, errVals)
+    keys := []string{"jsonrpc", "id", "error"}
+    vals := []json.Value{json.FromString("2.0"), id, errObj}
+    resp := json.FromObject(keys, vals)
+    respStr := json.MarshalValue(resp)
+    writeMessage(respStr)
+    libc.free(respStr)
+}
+
+// sendNotification sends a JSON-RPC notification (no id, no response expected).
+fn sendNotification(method: string, params: json.Value) {
+    keys := []string{"jsonrpc", "method", "params"}
+    vals := []json.Value{json.FromString("2.0"), json.FromString(method), params}
+    notif := json.FromObject(keys, vals)
+    notifStr := json.MarshalValue(notif)
+    writeMessage(notifStr)
+    libc.free(notifStr)
+}
+
+// ─── LSP Method Handlers ─────────────────────────────────────────────────
+
+// handleInitialize processes the initialize request.
+fn handleInitialize(s: *Server, id: json.Value, params: json.Value) {
+    // Extract rootPath from initialization options
+    rootUriVal := json.ObjectGet(params, "rootUri")
+    if rootUriVal.kind == 3 {
+        s.rootPath = json.AsString(rootUriVal)
+        // Strip file:// prefix
+        if str.StartsWith(s.rootPath, "file://") {
+            s.rootPath = str.Substr(s.rootPath, 7, str.Len(s.rootPath) - 7)
+        }
+    }
+    rootPathVal := json.ObjectGet(params, "rootPath")
+    if rootPathVal.kind == 3 && str.Len(s.rootPath) == 0 {
+        s.rootPath = json.AsString(rootPathVal)
+    }
+
+    // Build capabilities object
+    // textDocumentSync: use Full document sync (TextDocumentSyncKind = 1).
+    // This means the client sends the entire document text on every change,
+    // not incremental range-based edits. The server's handleDidChange only
+    // processes full-text contentChanges, so this must be 1 (not 2=Incremental).
+    // save:true tells the client to send textDocument/didSave notifications.
+    // The full resolver+checker diagnostic pass only runs on save because it
+    // is far too slow (tens of seconds to minutes for files importing the
+    // compiler's own modules) to run on every keystroke — doing so starved
+    // completion/hover requests behind the check and broke autocomplete.
+    syncKeys := []string{"openClose", "change", "willSave", "willSaveWaitUntil", "save"}
+    syncVals := []json.Value{json.FromBool(true), json.FromNumber(float(1)), json.FromBool(false), json.FromBool(false), json.FromBool(true)}
+    textSync := json.FromObject(syncKeys, syncVals)
+
+    compKeys := []string{"triggerCharacters", "resolveProvider"}
+    compVals := []json.Value{json.FromArray([]json.Value{json.FromString("."), json.FromString(":")}), json.FromBool(false)}
+    completion := json.FromObject(compKeys, compVals)
+
+    hoverKeys := []string{"contentFormat"}
+    hoverVals := []json.Value{json.FromArray([]json.Value{json.FromString("markdown"), json.FromString("plaintext")})}
+    hoverCap := json.FromObject(hoverKeys, hoverVals)
+
+    symKeys := []string{"hierarchicalDocumentSymbolSupport", "label"}
+    symVals := []json.Value{json.FromBool(true), json.FromString("Skink")}
+    docSymCap := json.FromObject(symKeys, symVals)
+
+    fmtCap := json.FromBool(true)
+
+    renameKeys := []string{"prepareSupport"}
+    renameVals := []json.Value{json.FromBool(false)}
+    renameCap := json.FromObject(renameKeys, renameVals)
+
+    semTokLegendKeys := []string{"tokenTypes", "tokenModifiers"}
+    semTokLegendVals := []json.Value{
+        json.FromArray([]json.Value{
+            json.FromString("keyword"), json.FromString("function"), json.FromString("type"),
+            json.FromString("struct"), json.FromString("enum"), json.FromString("variable"),
+            json.FromString("parameter"), json.FromString("property"), json.FromString("string"),
+            json.FromString("number"), json.FromString("comment"), json.FromString("operator"),
+            json.FromString("module"),
+        }),
+        json.FromArray([]json.Value{
+            json.FromString("declaration"), json.FromString("definition"), json.FromString("readonly"),
+            json.FromString("static"), json.FromString("deprecated"), json.FromString("modification"),
+        }),
+    }
+    semTokLegend := json.FromObject(semTokLegendKeys, semTokLegendVals)
+    semTokFullKeys := []string{"delta"}
+    semTokFullVals := []json.Value{json.FromBool(false)}
+    semTokFull := json.FromObject(semTokFullKeys, semTokFullVals)
+    semTok := json.FromObject([]string{"legend", "range", "full"}, []json.Value{semTokLegend, json.FromBool(false), semTokFull})
+
+    // documentRangeFormattingProvider is required for VS Code's
+    // editor.formatOnSaveMode:"modifications" and editor.formatOnPaste —
+    // both issue textDocument/rangeFormatting, never document/formatting.
+    // documentOnTypeFormattingProvider handles editor.formatOnType.
+    onTypeKeys := []string{"firstTriggerCharacter", "moreTriggerCharacter"}
+    onTypeVals := []json.Value{json.FromString("}"), json.FromArray([]json.Value{json.FromString(")"), json.FromString("]")})}
+    onTypeCap := json.FromObject(onTypeKeys, onTypeVals)
+
+    capsKeys := []string{
+        "textDocumentSync", "completionProvider", "hoverProvider",
+        "documentSymbolProvider", "definitionProvider", "referencesProvider",
+        "documentHighlightProvider", "documentFormattingProvider",
+        "documentRangeFormattingProvider", "documentOnTypeFormattingProvider",
+        "renameProvider", "semanticTokensProvider",
+    }
+    capsVals := []json.Value{
+        textSync, completion, hoverCap, docSymCap,
+        json.FromBool(true), json.FromBool(true), json.FromBool(true),
+        fmtCap, json.FromBool(true), onTypeCap, renameCap, semTok,
+    }
+    capabilities := json.FromObject(capsKeys, capsVals)
+
+    infoKeys := []string{"name", "version"}
+    infoVals := []json.Value{json.FromString("skink-lsp"), json.FromString(version.Version)}
+    serverInfo := json.FromObject(infoKeys, infoVals)
+
+    resultKeys := []string{"capabilities", "serverInfo"}
+    resultVals := []json.Value{capabilities, serverInfo}
+    result := json.FromObject(resultKeys, resultVals)
+
+    sendResponse(id, result)
+}
+
+// handleShutdown processes the shutdown request.
+fn handleShutdown(s: *Server, id: json.Value) {
+    s.shutdown = true
+    sendResponse(id, json.Null())
+}
+
+// handleInitialized processes the initialized notification.
+fn handleInitialized(s: *Server) {
+    s.initialized = true
+}
+
+// handleExit signals the server to exit.
+fn handleExit(s: *Server) {
+    s.exit = true
+}
+
+// handleDidOpen processes textDocument/didOpen.
+fn handleDidOpen(s: *Server, params: json.Value) {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+    text := json.AsString(json.ObjectGet(td, "text"))
+    version := int(json.AsNumber(json.ObjectGet(td, "version")))
+    documents.open(&s.docs, uri, text, version)
+    publishLexicalDiagnostics(s, uri)
+}
+
+// handleDidChange processes textDocument/didChange.
+fn handleDidChange(s: *Server, params: json.Value) {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+    version := int(json.AsNumber(json.ObjectGet(td, "version")))
+    changes := json.ObjectGet(params, "contentChanges")
+    n := json.ArrayLen(changes)
+    for i := 0; i < n; i = i + 1 {
+        change := json.ArrayGet(changes, i)
+        // Full document sync (textDocumentSync = 1)
+        textVal := json.ObjectGet(change, "text")
+        if textVal.kind == 3 {
+            documents.update(&s.docs, uri, json.AsString(textVal), version)
+        }
+    }
+    // If more input is already queued, this document state is stale — the
+    // pending didChange will publish diagnostics for the newer text instead.
+    if stdinPending() {
+        return
+    }
+    publishLexicalDiagnostics(s, uri)
+}
+
+// handleDidClose processes textDocument/didClose.
+fn handleDidClose(s: *Server, params: json.Value) {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+    documents.close(&s.docs, uri)
+    // Clear diagnostics for the closed document
+    diagParams := json.FromObject([]string{"uri", "diagnostics"}, []json.Value{json.FromString(uri), json.FromArray([]json.Value{})})
+    sendNotification("textDocument/publishDiagnostics", diagParams)
+}
+
+// handleDidSave processes textDocument/didSave. This is where the expensive
+// full type-check runs: the user expects a pause on save, and the single-
+// threaded server stays responsive to completion/hover while editing.
+fn handleDidSave(s: *Server, params: json.Value) {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+    publishDiagnostics(s, uri)
+}
+
+// publishDiagnostics runs the full checker (lexical pass + resolver + type
+// checker) on a document and publishes diagnostics. Only call this on save:
+// on files that import heavy std modules it takes tens of seconds to minutes.
+fn publishDiagnostics(s: *Server, uri: string) {
+    diags := diagnostics.check(&s.docs, uri, s.skinkHome)
+    diagParams := json.FromObject([]string{"uri", "diagnostics"}, []json.Value{json.FromString(uri), diags})
+    sendNotification("textDocument/publishDiagnostics", diagParams)
+}
+
+// publishLexicalDiagnostics runs only the fast lexical/syntax pass (no
+// resolver or type checker) and publishes diagnostics. Safe to run on every
+// keystroke — it returns in milliseconds.
+fn publishLexicalDiagnostics(s: *Server, uri: string) {
+    diags := diagnostics.checkFast(&s.docs, uri)
+    diagParams := json.FromObject([]string{"uri", "diagnostics"}, []json.Value{json.FromString(uri), diags})
+    sendNotification("textDocument/publishDiagnostics", diagParams)
+}
+
+// handleCompletion processes textDocument/completion.
+fn handleCompletion(s: *Server, id: json.Value, params: json.Value) {
+    result := completion.provide(&s.docs, params, s.skinkHome)
+    sendResponse(id, result)
+}
+
+// handleHover processes textDocument/hover.
+fn handleHover(s: *Server, id: json.Value, params: json.Value) {
+    result := hover.provide(&s.docs, params)
+    sendResponse(id, result)
+}
+
+// handleDocumentSymbol processes textDocument/documentSymbol.
+fn handleDocumentSymbol(s: *Server, id: json.Value, params: json.Value) {
+    result := symbols.provide(&s.docs, params)
+    sendResponse(id, result)
+}
+
+// handleDefinition processes textDocument/definition.
+fn handleDefinition(s: *Server, id: json.Value, params: json.Value) {
+    result := definition.provide(&s.docs, params)
+    sendResponse(id, result)
+}
+
+// handleFormatting processes textDocument/formatting.
+fn handleFormatting(s: *Server, id: json.Value, params: json.Value) {
+    result := formatting.provide(&s.docs, params)
+    sendResponse(id, result)
+}
+
+// handleRangeFormatting processes textDocument/rangeFormatting.
+fn handleRangeFormatting(s: *Server, id: json.Value, params: json.Value) {
+    result := formatting.provideRange(&s.docs, params)
+    sendResponse(id, result)
+}
+
+// handleOnTypeFormatting processes textDocument/onTypeFormatting.
+fn handleOnTypeFormatting(s: *Server, id: json.Value, params: json.Value) {
+    result := formatting.provideOnType(&s.docs, params)
+    sendResponse(id, result)
+}
+
+// handleDocumentHighlight processes textDocument/documentHighlight.
+fn handleDocumentHighlight(s: *Server, id: json.Value, params: json.Value) {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+    pos := json.ObjectGet(params, "position")
+    line := int(json.AsNumber(json.ObjectGet(pos, "line")))
+    character := int(json.AsNumber(json.ObjectGet(pos, "character")))
+
+    text, ok := documents.getText(&s.docs, uri)
+    if !ok {
+        sendResponse(id, json.Null())
+        return
+    }
+
+    // Find the word at the cursor position
+    word := utils.extractWordAt(text, line, character)
+    if str.Len(word) == 0 {
+        sendResponse(id, json.FromArray([]json.Value{}))
+        return
+    }
+
+    // Find all occurrences of the word in the document
+    highlights := findWordHighlights(text, word)
+    sendResponse(id, highlights)
+}
+
+// handleReferences processes textDocument/references.
+fn handleReferences(s: *Server, id: json.Value, params: json.Value) {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+    pos := json.ObjectGet(params, "position")
+    line := int(json.AsNumber(json.ObjectGet(pos, "line")))
+    character := int(json.AsNumber(json.ObjectGet(pos, "character")))
+
+    text, ok := documents.getText(&s.docs, uri)
+    if !ok {
+        sendResponse(id, json.FromArray([]json.Value{}))
+        return
+    }
+
+    word := utils.extractWordAt(text, line, character)
+    if str.Len(word) == 0 {
+        sendResponse(id, json.FromArray([]json.Value{}))
+        return
+    }
+
+    locations := findWordLocations(text, uri, word)
+    sendResponse(id, locations)
+}
+
+// handleRename processes textDocument/rename.
+fn handleRename(s: *Server, id: json.Value, params: json.Value) {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+    pos := json.ObjectGet(params, "position")
+    line := int(json.AsNumber(json.ObjectGet(pos, "line")))
+    character := int(json.AsNumber(json.ObjectGet(pos, "character")))
+    newNameVal := json.ObjectGet(params, "newName")
+    newName := json.AsString(newNameVal)
+
+    text, ok := documents.getText(&s.docs, uri)
+    if !ok {
+        sendResponse(id, json.Null())
+        return
+    }
+
+    word := utils.extractWordAt(text, line, character)
+    if str.Len(word) == 0 {
+        sendResponse(id, json.Null())
+        return
+    }
+
+    // Build text edits for all occurrences
+    edits := findWordEdits(text, word, newName)
+    changesKeys := []string{uri}
+    changesVals := []json.Value{edits}
+    changes := json.FromObject(changesKeys, changesVals)
+    result := json.FromObject([]string{"changes"}, []json.Value{changes})
+    sendResponse(id, result)
+}
+
+// handleSemanticTokens processes textDocument/semanticTokens/full.
+fn handleSemanticTokens(s: *Server, id: json.Value, params: json.Value) {
+    td := json.ObjectGet(params, "textDocument")
+    uri := json.AsString(json.ObjectGet(td, "uri"))
+
+    text, ok := documents.getText(&s.docs, uri)
+    if !ok {
+        sendResponse(id, json.Null())
+        return
+    }
+
+    tokens := computeSemanticTokens(text)
+    sendResponse(id, tokens)
+}
+
+// ─── JSON Utility Functions ──────────────────────────────────────────────
+
+// makeRange creates an LSP Range JSON object from 0-based line/character positions.
+fn makeRange(startLine: int, startChar: int, endLine: int, endChar: int) -> json.Value {
+    start := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(startLine)), json.FromNumber(float(startChar))})
+    end := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(endLine)), json.FromNumber(float(endChar))})
+    return json.FromObject([]string{"start", "end"}, []json.Value{start, end})
+}
+
+// makePosition creates an LSP Position JSON object.
+fn makePosition(line: int, character: int) -> json.Value {
+    return json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(line)), json.FromNumber(float(character))})
+}
+
+// ─── Main Server Loop ────────────────────────────────────────────────────
+
+fn main() -> int {
+    s := newServer()
+
+    for !s.exit {
+        body, eof := readMessage()
+        if eof {
+            break
+        }
+        if str.Len(body) == 0 {
+            libc.free(body)
+            continue
+        }
+
+        req, parseErr := json.Unmarshal(body)
+        libc.free(body)
+        if parseErr.message != "" {
+            continue
+        }
+
+        methodVal := json.ObjectGet(req, "method")
+        if methodVal.kind != 3 {
+            continue
+        }
+        method := json.AsString(methodVal)
+        idVal := json.ObjectGet(req, "id")
+        paramsVal := json.ObjectGet(req, "params")
+
+        // Dispatch to the appropriate handler
+        if str.Equal(method, "initialize") {
+            handleInitialize(&s, idVal, paramsVal)
+        } else if str.Equal(method, "initialized") {
+            handleInitialized(&s)
+        } else if str.Equal(method, "shutdown") {
+            handleShutdown(&s, idVal)
+        } else if str.Equal(method, "exit") {
+            handleExit(&s)
+        } else if str.Equal(method, "textDocument/didOpen") {
+            handleDidOpen(&s, paramsVal)
+        } else if str.Equal(method, "textDocument/didChange") {
+            handleDidChange(&s, paramsVal)
+        } else if str.Equal(method, "textDocument/didClose") {
+            handleDidClose(&s, paramsVal)
+        } else if str.Equal(method, "textDocument/didSave") {
+            handleDidSave(&s, paramsVal)
+        } else if str.Equal(method, "textDocument/completion") {
+            handleCompletion(&s, idVal, paramsVal)
+        } else if str.Equal(method, "textDocument/hover") {
+            handleHover(&s, idVal, paramsVal)
+        } else if str.Equal(method, "textDocument/documentSymbol") {
+            handleDocumentSymbol(&s, idVal, paramsVal)
+        } else if str.Equal(method, "textDocument/definition") {
+            handleDefinition(&s, idVal, paramsVal)
+        } else if str.Equal(method, "textDocument/formatting") {
+            handleFormatting(&s, idVal, paramsVal)
+        } else if str.Equal(method, "textDocument/rangeFormatting") {
+            handleRangeFormatting(&s, idVal, paramsVal)
+        } else if str.Equal(method, "textDocument/onTypeFormatting") {
+            handleOnTypeFormatting(&s, idVal, paramsVal)
+        } else if str.Equal(method, "textDocument/documentHighlight") {
+            handleDocumentHighlight(&s, idVal, paramsVal)
+        } else if str.Equal(method, "textDocument/references") {
+            handleReferences(&s, idVal, paramsVal)
+        } else if str.Equal(method, "textDocument/rename") {
+            handleRename(&s, idVal, paramsVal)
+        } else if str.Equal(method, "textDocument/semanticTokens/full") {
+            handleSemanticTokens(&s, idVal, paramsVal)
+        } else if str.Equal(method, "workspace/didChangeConfiguration") {
+            // No-op for now
+        } else {
+            // Unknown method — send error if this is a request (has an id)
+            if idVal.kind != 0 {
+                sendErrorResponse(idVal, -32601, str.Concat("Method not found: ", method))
+            }
+        }
+    }
+
+    if s.shutdown {
+        return 0
+    }
+    return 1
+}
+
+// ─── Helper Functions ────────────────────────────────────────────────────
+
+// findWordHighlights finds all occurrences of word in text and returns
+// LSP DocumentHighlight JSON values.
+fn findWordHighlights(text: string, word: string) -> json.Value {
+    if str.Len(word) == 0 {
+        return json.FromArray([]json.Value{})
+    }
+    var highlights []json.Value
+    line := 0
+    col := 0
+    i := 0
+    for i < str.Len(text) {
+        if text[i] == 10 {
+            line = line + 1
+            col = 0
+            i = i + 1
+            continue
+        }
+        if utils.isIdentChar(int(text[i])) {
+            start := i
+            for i < str.Len(text) && utils.isIdentChar(int(text[i])) {
+                i = i + 1
+            }
+            w := str.Substr(text, start, i - start)
+            if str.Equal(w, word) {
+                rangeStart := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(line)), json.FromNumber(float(col))})
+                rangeEnd := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(line)), json.FromNumber(float(col + str.Len(word)))})
+                rangeVal := json.FromObject([]string{"start", "end"}, []json.Value{rangeStart, rangeEnd})
+                highlight := json.FromObject([]string{"range", "kind"}, []json.Value{rangeVal, json.FromNumber(float(1))})
+                highlights = append(highlights, highlight)
+            }
+            col = col + (i - start)
+        } else {
+            col = col + 1
+            i = i + 1
+        }
+    }
+    return json.FromArray(highlights)
+}
+
+// findWordLocations finds all occurrences of word in text and returns
+// LSP Location JSON values.
+fn findWordLocations(text: string, uri: string, word: string) -> json.Value {
+    if str.Len(word) == 0 {
+        return json.FromArray([]json.Value{})
+    }
+    var locations []json.Value
+    line := 0
+    col := 0
+    i := 0
+    for i < str.Len(text) {
+        if text[i] == 10 {
+            line = line + 1
+            col = 0
+            i = i + 1
+            continue
+        }
+        if utils.isIdentChar(int(text[i])) {
+            start := i
+            for i < str.Len(text) && utils.isIdentChar(int(text[i])) {
+                i = i + 1
+            }
+            w := str.Substr(text, start, i - start)
+            if str.Equal(w, word) {
+                rangeStart := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(line)), json.FromNumber(float(col))})
+                rangeEnd := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(line)), json.FromNumber(float(col + str.Len(word)))})
+                rangeVal := json.FromObject([]string{"start", "end"}, []json.Value{rangeStart, rangeEnd})
+                loc := json.FromObject([]string{"uri", "range"}, []json.Value{json.FromString(uri), rangeVal})
+                locations = append(locations, loc)
+            }
+            col = col + (i - start)
+        } else {
+            col = col + 1
+            i = i + 1
+        }
+    }
+    return json.FromArray(locations)
+}
+
+// findWordEdits finds all occurrences of word in text and returns
+// LSP TextEdit JSON values that rename them to newName.
+fn findWordEdits(text: string, word: string, newName: string) -> json.Value {
+    if str.Len(word) == 0 {
+        return json.FromArray([]json.Value{})
+    }
+    var edits []json.Value
+    line := 0
+    col := 0
+    i := 0
+    for i < str.Len(text) {
+        if text[i] == 10 {
+            line = line + 1
+            col = 0
+            i = i + 1
+            continue
+        }
+        if utils.isIdentChar(int(text[i])) {
+            start := i
+            for i < str.Len(text) && utils.isIdentChar(int(text[i])) {
+                i = i + 1
+            }
+            w := str.Substr(text, start, i - start)
+            if str.Equal(w, word) {
+                rangeStart := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(line)), json.FromNumber(float(col))})
+                rangeEnd := json.FromObject([]string{"line", "character"}, []json.Value{json.FromNumber(float(line)), json.FromNumber(float(col + str.Len(word)))})
+                rangeVal := json.FromObject([]string{"start", "end"}, []json.Value{rangeStart, rangeEnd})
+                edit := json.FromObject([]string{"range", "newText"}, []json.Value{rangeVal, json.FromString(newName)})
+                edits = append(edits, edit)
+            }
+            col = col + (i - start)
+        } else {
+            col = col + 1
+            i = i + 1
+        }
+    }
+    return json.FromArray(edits)
+}
+
+// computeSemanticTokens computes semantic tokens for the given text.
+// Returns an LSP SemanticTokens JSON value with a flat data array.
+fn computeSemanticTokens(text: string) -> json.Value {
+    tokens := lexer.Tokenize(text)
+    var data []json.Value
+    prevLine := 0
+    prevCol := 0
+    for i := 0; i < len(tokens); i = i + 1 {
+        tok := tokens[i]
+        tokenType := 0
+        if tok.kind == lexer.T_IDENT {
+            tokenType = 5 // variable
+        } else if tok.kind == lexer.T_STRING  {
+            tokenType = 8 // string
+        } else if tok.kind == lexer.T_FLOAT && str.Equal(tok.literal, "float") {
+            tokenType = 2 // type (the lexer maps the "float" keyword to T_FLOAT)
+        } else if tok.kind == lexer.T_INT || tok.kind == lexer.T_FLOAT {
+            tokenType = 9 // number
+        } else if tok.kind == lexer.T_COMMENT || tok.kind == lexer.T_DOC {
+            tokenType = 10 // comment
+        } else if tok.kind >= lexer.T_INT8 && tok.kind <= lexer.T_BYTES_TYPE {
+            tokenType = 2 // type
+        } else if tok.kind >= lexer.T_FN && tok.kind <= lexer.T_INTO {
+            tokenType = 0 // keyword
+        } else {
+            continue
+        }
+        line := tok.line - 1
+        col := tok.col - 1
+        deltaLine := line - prevLine
+        deltaCol := col
+        if deltaLine == 0 {
+            deltaCol = col - prevCol
+        }
+        length := str.Len(tok.literal)
+        data = append(data, json.FromNumber(float(deltaLine)))
+        data = append(data, json.FromNumber(float(deltaCol)))
+        data = append(data, json.FromNumber(float(length)))
+        data = append(data, json.FromNumber(float(tokenType)))
+        data = append(data, json.FromNumber(float(0)))  // no modifiers
+        prevLine = line
+        prevCol = col
+    }
+    return json.FromObject([]string{"data"}, []json.Value{json.FromArray(data)})
+}
+
+
+
+
+
+
+
+
+
+
+
