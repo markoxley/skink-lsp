@@ -1,6 +1,6 @@
 # skink-lsp
 
-A Language Server Protocol (LSP) implementation for the [Skink](https://github.com/skink-lang/skink) programming language, written in Skink itself.
+A Language Server Protocol (LSP) implementation for the [Skink](https://github.com/markoxley/skink) programming language, written in Skink itself.
 
 ## Features
 
