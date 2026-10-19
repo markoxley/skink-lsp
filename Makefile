@@ -17,7 +17,7 @@ FMT_BIN     := skinkfmt
 SKINK       ?= skink
 # Point SKINK_HOME at the Skink standard library directory (containing std/
 # sources and the runtime/ C files). The compiler repo's std/ dir works.
-SKINK_HOME  ?= $(abspath ../skink/std)
+SKINK_HOME  ?= $(abspath ../../skink/std)
 
 # LSP source files
 LSP_MAIN    := lsp.skink
