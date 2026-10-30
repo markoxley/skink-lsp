@@ -21,6 +21,8 @@ import "std/strconv"
 import "std/fs"
 import "std/io"
 import "std/libc"
+
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
 import "lsp/formatting"
 
 extern fn read(fd: int, buf: string, count: int) -> int
@@ -50,7 +52,7 @@ fn readAllStdin() -> string {
         total = total + n
     }
     libc.free(chunk)
-    result[total] = 0
+    Skink_mem_write_byte(result, int64(total), 0)
     return result
 }
 

@@ -12,6 +12,8 @@ import "std/json"
 import "std/errors"
 import "std/str"
 import "std/libc"
+
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
 import "std/buf"
 import "std/lexer"
 import "std/strconv"
@@ -85,6 +87,9 @@ fn newServer() -> Server {
         // Read headers until we find an empty line (\r\n\r\n)
         contentLength := 0
         ch := libc.malloc(1)
+        if int64(ch) == 0 {
+            return "", true
+        }
 
         // Read header lines
         for {
@@ -98,14 +103,21 @@ fn newServer() -> Server {
                 libc.free(line)
                 break
             }
-            // Parse Content-Length header
+            // Parse Content-Length header. A crafted length above 64 MiB
+            // would drive a giant malloc and crash the server on OOM —
+            // reject it instead (comp_error.md #159).
             if str.StartsWith(line, "Content-Length:") {
                 valStart := 15
                 if valStart < str.Len(line) {
                     val := str.Trim(str.Substr(line, valStart, str.Len(line) - valStart))
                     parsed, ok := strconv.ParseInt(val)
-                    if ok {
+                    if ok && parsed > 0 && parsed <= 67108864 {
                         contentLength = parsed
+                    } else if ok && parsed > 67108864 {
+                        libc.free(val)
+                        libc.free(line)
+                        libc.free(ch)
+                        return "", true
                     }
                     libc.free(val)
                 }
@@ -120,6 +132,9 @@ fn newServer() -> Server {
 
         // Read the JSON body (exactly contentLength bytes)
         body := libc.malloc(contentLength + 1)
+        if int64(body) == 0 {
+            return "", true
+        }
         readSoFar := 0
         for readSoFar < contentLength {
             n := read(0, string(int64(body) + int64(readSoFar)), contentLength - readSoFar)
@@ -129,13 +144,16 @@ fn newServer() -> Server {
             }
             readSoFar = readSoFar + n
         }
-        body[contentLength] = 0
+        Skink_mem_write_byte(body, int64(contentLength), 0)
         return body, false
     }
 
     // readLine reads a single line from stdin (terminated by \n).
     // The returned string includes the trailing \r if present but not the \n.
     // Uses the provided 1-byte buffer to avoid repeated allocations.
+    // Lines longer than 8 KiB end the read (treated as EOF) — a
+    // malicious peer could otherwise grow the line buffer without bound
+    // (comp_error.md #159).
     fn readLine(ch: string) -> (string, bool) {
         buffer := buf.NewBuffer()
         for {
@@ -150,6 +168,10 @@ fn newServer() -> Server {
                 return result, false
             }
             buffer.WriteByte(int(ch[0]))
+            if buffer.Len() > 8192 {
+                buffer.Free()
+                return "", true
+            }
         }
     }
 

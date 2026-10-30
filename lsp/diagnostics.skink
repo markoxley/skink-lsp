@@ -14,10 +14,12 @@ import "std/ast"
 import "std/fs"
 import "lsp/documents"
 
-// tempCounter is a module-level counter used to generate unique temp-file
-// names for type-checking. This prevents two concurrent checkTypes calls
-// (e.g. for two files in the same directory) from racing on the same path.
-var tempCounter int = 0
+// Skink_fs_mktemp_in creates a uniquely-named 0600 file (O_CREAT|O_EXCL)
+// in the given directory and returns its path as an RC-managed string.
+// Used for the co-located type-check temp file so a planted symlink in a
+// shared directory can neither redirect the write nor clobber a victim
+// file (comp_error.md #159).
+extern fn Skink_fs_mktemp_in(dir: string, prefix: string, suffix: string) -> string
 
 // check runs the Skink checker on the document with the given URI and
 // returns an array of LSP Diagnostic JSON values.
@@ -144,15 +146,20 @@ fn checkTypes(text: string, uri: string, skinkHome: string) -> []json.Value {
     // the file watcher in the extension (**/*.skink) doesn't pick it up and
     // trigger a feedback loop.
     //
-    // The filename includes a per-process counter so that two concurrent
-    // checks of files in the same directory don't race on the same path.
-    // If the source directory is read-only (common for library code in
-    // /usr/local/lib), writeFile fails and we return no type diagnostics
+    // The file is created via Skink_fs_mktemp_in: O_CREAT|O_EXCL|0600 with
+    // an unpredictable name, so in a directory writable by other users a
+    // planted symlink can neither redirect the write to an arbitrary file
+    // nor make us overwrite a victim's file (comp_error.md #159). If the
+    // source directory is read-only (common for library code in
+    // /usr/local/lib), creation fails and we return no type diagnostics
     // rather than silently writing to the wrong location.
     dir := dirOf(filePath)
-    tempCounter = tempCounter + 1
-    tmpFile := joinPath(dir, str.Concat(str.Concat(".skink_lsp_check_", intStr(tempCounter)), ".lspcheck"))
+    tmpFile := Skink_fs_mktemp_in(dir, ".skink_lsp_check_", ".lspcheck")
+    if int64(tmpFile) == 0 || str.Len(tmpFile) == 0 {
+        return diags
+    }
     if !writeFile(tmpFile, text) {
+        removeFile(tmpFile)
         return diags
     }
 
@@ -214,17 +221,6 @@ fn lastSlash(p: string) -> int {
         i = i - 1
     }
     return -1
-}
-
-// joinPath joins a directory and file name with a '/' separator.
-fn joinPath(dir: string, name: string) -> string {
-    if str.Len(dir) == 0 || str.Equal(dir, ".") {
-        return name
-    }
-    if dir[str.Len(dir) - 1] == 47 { // ends with '/'
-        return str.Concat(dir, name)
-    }
-    return str.Concat(str.Concat(dir, "/"), name)
 }
 
 // removeFile deletes a file from disk. Errors are silently ignored.
