@@ -21,7 +21,7 @@ A Language Server Protocol (LSP) implementation for the [Skink](https://github.c
 make
 ```
 
-This requires the Skink compiler (`skink`) to be installed and the Skink standard library to be available at `../skink/std` (the `std` directory inside the `skink` compiler repository). Override `SKINK_HOME` if your standard library is elsewhere:
+This requires the Skink compiler (`skink`) to be installed and the Skink standard library to be available at `../../skink/std` (the `std` directory inside the `skink` compiler repository). Override `SKINK_HOME` if your standard library is elsewhere:
 
 ```bash
 make SKINK_HOME=/usr/local/lib/skink/std
@@ -33,7 +33,8 @@ make SKINK_HOME=/usr/local/lib/skink/std
 make install
 ```
 
-This installs the `skink-lsp` binary to `/usr/local/bin/`.
+This installs the `skink-lsp` and `skinkfmt` binaries to `/usr/local/bin/`
+(override with `make PREFIX=/your/prefix install`).
 
 ## Editor Configuration
 
